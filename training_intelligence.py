@@ -298,6 +298,33 @@ def tsb_label(tsb: float) -> str:
     return "molto affaticato (rischio sovraccarico)"
 
 
+def recovery_status(tsb: float) -> str:
+    """Stato di recupero attuale dal TSB (facet del bilancio forma/fatica)."""
+    if tsb >= 5:    return "Pienamente recuperato"
+    if tsb >= -10:  return "Recuperato"
+    if tsb >= -20:  return "Recupero parziale"
+    return "Recupero necessario"
+
+
+def recovery_forecast(ctl: float, atl: float, target_tsb: float = 5,
+                      max_days: int = 21) -> int:
+    """
+    Giorni di RIPOSO stimati per tornare 'freschi' (TSB >= target_tsb).
+    Simula giorni a TSS=0: ATL decade (tc 7gg) piu' in fretta di CTL (tc 42gg),
+    quindi il TSB risale. 0 = gia' fresco; max_days = oltre l'orizzonte.
+    Stima su modello (Banister/Coggan), non tiene conto di sonno/HRV/vita reale.
+    """
+    if ctl - atl >= target_tsb:
+        return 0
+    c, a = ctl, atl
+    for d in range(1, max_days + 1):
+        c += (0 - c) / 42
+        a += (0 - a) / 7
+        if c - a >= target_tsb:
+            return d
+    return max_days
+
+
 def _session_template(kind: str, ftp: float) -> dict:
     """Struttura concreta della sessione consigliata, ancorata alla FTP."""
     t = {
