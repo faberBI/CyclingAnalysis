@@ -280,6 +280,35 @@ def test_periodized_plan_too_close_is_all_taper():
     assert ps["base_weeks"] == 0 and ps["build_weeks"] == 0    # niente build a <2 settimane
 
 
+# ===================== FAT OX / PRO / AMATORI ============================= #
+def test_fat_oxidation_curve_has_interior_peak():
+    foc = ca.fat_oxidation_curve(map_watt=350, athlete=ATH)
+    df = foc["curve"]
+    imax = int(df["fat_g_min"].idxmax())
+    assert 0 < imax < len(df) - 1                     # picco interno, non ai bordi
+    assert 40 <= foc["fatmax_pct"] <= 75              # FatMax a intensità plausibile
+    assert foc["confidence"] == Confidence.MODELED    # senza gas = modellato
+    # ai bordi l'ossidazione grassi è minore che al picco
+    assert df["fat_g_min"].iloc[0] < foc["fatmax_fat_g_min"]
+    assert df["fat_g_min"].iloc[-1] < foc["fatmax_fat_g_min"]
+
+def test_pro_comparison_pct_pogacar():
+    # 20min a 6.9 W/kg (= Pogačar) -> 100%
+    mmp = pd.Series({1200: 6.9 * 70})
+    pc = ca.pro_comparison(mmp, mass_kg=70)
+    row = [r for r in pc["rows"] if r["dur_s"] == 1200][0]
+    assert row["tu"] == pytest.approx(6.9, abs=0.01)
+    assert row["pct_pogacar"] == 100
+
+def test_classify_amateur_bands():
+    assert ca.classify_amateur(2.8)["tier"].startswith("Amatore base")
+    assert ca.classify_amateur(3.4)["tier"].startswith("Amatore intermedio")
+    assert ca.classify_amateur(4.1)["tier"].startswith("Amatore avanzato")
+    assert ca.classify_amateur(4.8)["tier"].startswith("Agonista")
+    # posizione monotona crescente
+    assert ca.classify_amateur(2.8)["position"] < ca.classify_amateur(4.1)["position"]
+
+
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     import sys
