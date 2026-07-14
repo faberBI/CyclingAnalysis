@@ -103,11 +103,12 @@ try:
         aid = st.sidebar.text_input("ID atleta (es. i382978, oppure 0)", value="0",
                                     help="Lo trovi in Impostazioni sviluppatore. '0' = atleta della chiave.")
         if key and aid:
+            st.session_state["icu_creds"] = {"key": key, "aid": aid}
             acts = ca.list_intervals_activities(aid, key)
             if acts:
                 labels = {f"{a['date']} · {a['name'] or a['type']}  ({a['id']})": a["id"]
                           for a in acts}
-                choice = st.sidebar.selectbox("Scegli un'attività", list(labels.keys()))
+                choice = st.sidebar.selectbox("Scegli un'attività (analisi singola)", list(labels.keys()))
                 raw = ca.load_intervals_icu(labels[choice], key)
             else:
                 st.sidebar.info("Nessuna attività trovata negli ultimi mesi.")
@@ -150,7 +151,8 @@ if has_power:
 
 tabs = st.tabs(["📈 Curva di potenza", "🎯 Soglie & Zone", "🔬 Analisi sessione",
                 "❤️ Stato di forma", "🔥 Metabolismo & Nutrizione",
-                "🏆 Classificazione", "📅 Settimana & Piano", "📆 Periodizzazione"])
+                "🏆 Classificazione", "📅 Settimana & Piano", "📆 Periodizzazione",
+                "🗓️ Stagione (tutte le attività)"])
 
 # ---- 1. CURVA DI POTENZA -------------------------------------------------- #
 with tabs[0]:
@@ -262,8 +264,24 @@ with tabs[2]:
 
 # ---- 4. STATO DI FORMA (VO2max) ------------------------------------------- #
 with tabs[3]:
-    if map_m:
-        vo2 = ca.estimate_vo2max(athlete, map_m.value)
+    # usa la curva stagionale se caricata, altrimenti la singola uscita
+    _season = st.session_state.get("season_curve")
+    _use_season = _season is not None and len(_season) > 0
+    _curve = _season if _use_season else mmp
+    map_for_vo2 = None
+    if len(_curve) and 300 in _curve.index:
+        map_for_vo2 = ca.maximal_aerobic_power(_curve)
+    elif map_m:
+        map_for_vo2 = map_m
+
+    if map_for_vo2:
+        if _use_season:
+            st.success(f"✅ Calcolato sulla **curva stagionale** "
+                       f"({st.session_state.get('season_used', 0)} attività) — attendibile.")
+        else:
+            st.warning("⚠️ Calcolato sulla **singola uscita** selezionata. Per un valore attendibile "
+                       "carica lo storico nella scheda 🗓️ Stagione.")
+        vo2 = ca.estimate_vo2max(athlete, map_for_vo2.value)
         st.markdown("### VO2max")
         vc = st.columns([1, 2])
         metric_card(vc[0], "VO2max", vo2["vo2max"])
@@ -281,7 +299,8 @@ with tabs[3]:
                else "nella media" if v>40 else "da migliorare")
         st.info(f"VO2max ~{v:.0f} mL/kg/min → livello aerobico: **{lvl}**")
     else:
-        st.info("Serve la MAP (miglior 5 min o test rampa) per stimare la VO2max.")
+        st.info("Serve la MAP (miglior 5 min o test rampa). Carica lo storico nella scheda 🗓️ Stagione "
+                "oppure seleziona un'uscita che contenga uno sforzo di ~5 min.")
 
 # ---- 5. METABOLISMO & NUTRIZIONE ------------------------------------------ #
 with tabs[4]:
@@ -330,8 +349,18 @@ with tabs[4]:
 
 # ---- 6. CLASSIFICAZIONE (upgraded) ---------------------------------------- #
 with tabs[5]:
-    if has_power and len(mmp):
-        rt = ca.rider_type_full(mmp, mass)
+    _season = st.session_state.get("season_curve")
+    _use_season = _season is not None and len(_season) > 0
+    _curve = _season if _use_season else (mmp if (has_power and len(mmp)) else None)
+    if _curve is not None and len(_curve):
+        if _use_season:
+            st.success(f"✅ Classificazione sulla **curva stagionale** "
+                       f"({st.session_state.get('season_used', 0)} attività) — così ha davvero senso.")
+        else:
+            st.warning("⚠️ Classificazione sulla **singola uscita**: poco attendibile, perché una sola "
+                       "uscita raramente contiene sforzi massimali a tutte le durate. Carica lo storico "
+                       "nella scheda 🗓️ Stagione per una classificazione corretta.")
+        rt = ca.rider_type_full(_curve, mass)
         st.markdown(f"## {rt['primary']} {badge(rt['confidence'])}", unsafe_allow_html=True)
         st.write(rt["reasoning"])
         q = rt.get("qualities", {})
@@ -348,7 +377,7 @@ with tabs[5]:
             c1.caption("Scala 0 (amatore) → 1 (top-10 TdF) per qualità.")
             with c2:
                 st.markdown("#### Confronto con le categorie")
-                cl = ca.classify_category(mmp, mass)
+                cl = ca.classify_category(_curve, mass)
                 dl = {5:"Sprint 5s",60:"Anaerobico 1min",300:"VO2max 5min",1200:"Soglia 20min"}
                 st.dataframe(pd.DataFrame([{"Qualità":dl.get(d,f"{d}s"),"W/kg":i["w_kg"],
                             "Watt":i["watt"],"Livello":i["category_label"]}
@@ -356,12 +385,11 @@ with tabs[5]:
                             hide_index=True, use_container_width=True)
         st.warning("⚠️ ONESTÀ SUI BENCHMARK: i livelli amatoriali derivano dal Power Profile di "
                    "Coggan (robusti). I livelli pro / top-20 Grande Giro / top-10 Tour sono STIME da "
-                   "letteratura e analisi di potenza sulle salite (SRM, VAM), NON da laboratorio. "
-                   "Ordini di grandezza. Inoltre la classificazione è valida solo su una curva "
-                   "STAGIONALE con sforzi massimali reali a tutte le durate — una singola uscita "
-                   "quasi mai li contiene tutti (usa più uscite).")
+                   "letteratura e analisi di potenza sulle salite (SRM, VAM), NON da laboratorio: "
+                   "trattali come ordini di grandezza.")
     else:
-        st.info("Servono dati di potenza per la classificazione.")
+        st.info("Servono dati di potenza (o la curva stagionale dalla scheda 🗓️ Stagione) "
+                "per la classificazione.")
 
 # ---- 7. SETTIMANA & PIANO (NEW) ------------------------------------------- #
 with tabs[6]:
@@ -505,6 +533,116 @@ with tabs[7]:
         for wn in plan["warnings"]:
             st.warning("⚠️ " + wn)
         st.caption("⚠️ " + plan["disclaimer"])
+
+# ---- 9. STAGIONE — MULTI-ATTIVITÀ (NEW) ----------------------------------- #
+with tabs[8]:
+    st.markdown("### Analisi stagione — tutte le attività")
+    st.caption("Curva di potenza, VO2max, CP/W', classificazione e forma nel tempo hanno senso "
+               "solo AGGREGANDO molte uscite. Qui leggo tutto lo storico da intervals.icu. "
+               "Le altre schede analizzano invece la singola uscita selezionata nella sidebar.")
+    creds = st.session_state.get("icu_creds")
+    if not creds:
+        st.info("Per questa scheda seleziona la sorgente **intervals.icu (API)** nella sidebar e "
+                "inserisci ID atleta + API key.")
+    else:
+        w = st.selectbox("Finestra per la curva di potenza aggregata",
+                         ["Ultimi 90 giorni", "Ultimi 6 mesi", "Ultimi 12 mesi", "Tutto"], index=0)
+        days = {"Ultimi 90 giorni": 90, "Ultimi 6 mesi": 183,
+                "Ultimi 12 mesi": 365, "Tutto": 3650}[w]
+        maxact = st.slider("Max attività da scaricare per la curva (più = più lento)", 10, 150, 60)
+
+        if st.button("🔄 Analizza tutto lo storico", type="primary"):
+            try:
+                with st.spinner("Scarico l'elenco delle attività..."):
+                    acts = ca.list_intervals_activities(creds["aid"], creds["key"],
+                                                        days_back=days, limit=2000)
+                st.session_state["season_acts"] = acts
+                pw = [a for a in acts if a.get("has_power")][:maxact]
+                prog = st.progress(0.0, text=f"Scarico gli streams di {len(pw)} attività...")
+                season, used = ca.season_power_curve_from_intervals(
+                    creds["aid"], creds["key"], [a["id"] for a in pw],
+                    progress_cb=lambda f: prog.progress(min(f, 1.0)))
+                st.session_state["season_curve"] = season
+                st.session_state["season_used"] = used
+                prog.empty()
+            except Exception as e:
+                st.error(f"Errore durante il caricamento: {e}")
+
+        acts = st.session_state.get("season_acts")
+        if acts:
+            n = len(acts)
+            tot_tss = sum(a.get("load") or 0 for a in acts)
+            tot_h = sum(a.get("moving_time") or 0 for a in acts) / 3600
+            tot_km = sum(a.get("distance") or 0 for a in acts) / 1000
+            m = st.columns(4)
+            m[0].metric("Attività", n)
+            m[1].metric("Ore totali", f"{tot_h:.0f}")
+            m[2].metric("Distanza", f"{tot_km:,.0f} km")
+            m[3].metric("TSS totale", f"{tot_tss:,.0f}")
+
+            pmc = ti.pmc_from_activities(acts)
+            if len(pmc):
+                st.markdown("#### Forma nel tempo — tutta la storia (CTL / ATL / TSB)")
+                px = pd.to_datetime(pmc["day"])
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=px, y=pmc["ctl"], name="Fitness (CTL)",
+                                         line=dict(color="#0A45FA", width=2.5)))
+                fig.add_trace(go.Scatter(x=px, y=pmc["atl"], name="Fatica (ATL)",
+                                         line=dict(color="#B0392E", width=1.2, dash="dot")))
+                fig.add_trace(go.Scatter(x=px, y=pmc["tsb"], name="Forma (TSB)",
+                                         line=dict(color="#2e9e5b", width=1.2), yaxis="y2"))
+                fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0),
+                                  yaxis=dict(title="CTL / ATL"),
+                                  yaxis2=dict(title="TSB", overlaying="y", side="right"),
+                                  legend=dict(orientation="h", y=1.15))
+                st.plotly_chart(fig, use_container_width=True)
+                tsb_now = pmc["tsb"].iloc[-1]
+                st.caption(f"Forma attuale (TSB): {tsb_now:+.0f} — {ti.tsb_label(tsb_now)}. "
+                           f"Fitness attuale (CTL): {pmc['ctl'].iloc[-1]:.0f}.")
+
+            season = st.session_state.get("season_curve")
+            if season is not None and len(season):
+                used = st.session_state.get("season_used", 0)
+                st.markdown(f"#### Curva di potenza aggregata su {used} attività "
+                            f"{badge(Confidence.MEASURED)}", unsafe_allow_html=True)
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=season.index, y=season.values, mode="lines",
+                                         line=dict(color="#0A45FA", width=3)))
+                fig.update_xaxes(type="log", title="Durata (scala log)",
+                                 tickvals=[1, 5, 15, 60, 300, 1200, 3600, 10800],
+                                 ticktext=["1s", "5s", "15s", "1m", "5m", "20m", "1h", "3h"])
+                fig.update_yaxes(title="Potenza (W)")
+                fig.update_layout(height=380, margin=dict(l=0, r=0, t=10, b=0), showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+
+                if len(season[(season.index >= 120) & (season.index <= 1200)]) >= 3:
+                    cp = ca.critical_power(season, model="3param")
+                    ftp = ca.estimate_ftp(season, cp=cp["cp"].value)
+                    mapm = ca.maximal_aerobic_power(season)
+                    vo2 = ca.estimate_vo2max(athlete, mapm.value)
+                    st.markdown("#### Metriche di profilo (dalla curva aggregata)")
+                    cA = st.columns(4)
+                    metric_card(cA[0], "FTP stagionale", ftp["ftp_recommended"])
+                    metric_card(cA[1], "Critical Power", cp["cp"])
+                    metric_card(cA[2], "VO2max", vo2["vo2max"])
+                    metric_card(cA[3], "MAP", mapm)
+
+                    rt = ca.rider_type_full(season, mass)
+                    st.markdown(f"##### Tipo di corridore: **{rt['primary']}** "
+                                f"{badge(rt['confidence'])}", unsafe_allow_html=True)
+                    st.write(rt["reasoning"])
+                    cl = ca.classify_category(season, mass)
+                    dl = {5: "Sprint 5s", 60: "Anaerobico 1min",
+                          300: "VO2max 5min", 1200: "Soglia 20min"}
+                    st.dataframe(pd.DataFrame([{"Qualità": dl.get(d, f"{d}s"), "W/kg": i["w_kg"],
+                                "Watt": i["watt"], "Livello": i["category_label"]}
+                                for d, i in cl["per_duration"].items()]),
+                                hide_index=True, use_container_width=True)
+                    st.caption("Questa classificazione è su base stagionale (molte uscite), quindi "
+                               "ha davvero senso — a differenza di quella su una singola uscita.")
+                else:
+                    st.info("Nella finestra scelta mancano sforzi massimali tra 2 e 20 min per "
+                            "stimare CP / FTP / VO2max in modo affidabile. Prova ad allargare la finestra.")
 
 # ---- footer legenda ------------------------------------------------------- #
 st.divider()
