@@ -32,6 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
+import time
 import numpy as np
 import pandas as pd
 from scipy.optimize import curve_fit
@@ -778,9 +779,42 @@ def list_intervals_activities(athlete_id: str, api_key: str,
     rows = [{"id": a.get("id"),
              "name": a.get("name") or "",
              "date": (a.get("start_date_local") or a.get("start_date") or "")[:10],
-             "type": a.get("type") or ""} for a in acts if a.get("id")]
+             "type": a.get("type") or "",
+             "load": a.get("icu_training_load") or a.get("training_load") or 0,
+             "moving_time": a.get("moving_time") or a.get("elapsed_time") or 0,
+             "distance": a.get("distance") or 0,
+             "has_power": bool(a.get("icu_average_watts") or a.get("average_watts"))}
+            for a in acts if a.get("id")]
     rows.sort(key=lambda x: x["date"], reverse=True)
     return rows[:limit]
+
+
+def season_power_curve_from_intervals(athlete_id: str, api_key: str,
+                                      activity_ids: list[str],
+                                      progress_cb=None) -> tuple[pd.Series, int]:
+    """
+    Costruisce la CURVA DI POTENZA STAGIONALE scaricando gli streams di piu' attivita'
+    e prendendo il massimo punto-a-punto (season_power_curve). Una chiamata /streams
+    per attivita': fa pacing (~8 req/s) per rispettare il limite di 10/s di intervals.icu.
+    Ritorna (curva MMP aggregata, numero di attivita' effettivamente usate).
+    """
+    curves, used = [], 0
+    n = len(activity_ids) or 1
+    for i, aid in enumerate(activity_ids):
+        try:
+            df1 = to_1hz(load_intervals_icu(aid, api_key))
+            if "power" in df1 and float(df1["power"].sum()) > 0:
+                curves.append(mean_maximal_power(df1["power"].values))
+                used += 1
+        except Exception:
+            pass                      # attivita' senza potenza / errore singolo: salta
+        if progress_cb:
+            progress_cb((i + 1) / n)
+        time.sleep(0.12)              # ~8 richieste/secondo
+    if not curves:
+        return pd.Series(dtype=float), 0
+    season = pd.concat(curves, axis=1).max(axis=1).rename("mmp_watt")
+    return season, used
 
 
 # --------------------------------------------------------------------------- #
