@@ -1,0 +1,24 @@
+# Cycling Lab — dipendenze
+# Installazione:  pip install -r requirements.txt
+# Avvio:          streamlit run app.py
+
+# --- core (sempre necessari) ---
+streamlit>=1.30        # UI + st.data_editor / column_config (testato su 1.59)
+pandas>=2.0            # (testato su 3.0)
+numpy>=1.24            # (testato su 2.4)
+scipy>=1.10            # curve_fit per il modello Critical Power/W' (testato su 1.17)
+plotly>=5.15           # grafici interattivi: curva potenza, W'bal, PMC (testato su 6.9)
+
+# --- sorgenti dati (necessari solo per le rispettive sorgenti) ---
+fitparse>=1.2.0        # lettura file .fit (Garmin / Polar / Wahoo)
+requests>=2.28         # API intervals.icu
+
+# ---------------------------------------------------------------------------
+# Se preferisci pin esatti per la riproducibilità, usa le versioni testate:
+#   streamlit==1.59.2
+#   pandas==3.0.2
+#   numpy==2.4.4
+#   scipy==1.17.1
+#   plotly==6.9.0
+#   fitparse==1.2.0
+#   requests==2.33.1
