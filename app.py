@@ -259,6 +259,38 @@ with tabs[2]:
                 st.caption("<5% = buona durabilità.")
         with st.expander("Evidenze (tempo per zona, %)"):
             st.write(wt["evidence_pct"])
+
+        st.divider()
+        st.markdown("#### 🔋 Durability (potenza da stanco)")
+        st.caption("Il differenziatore vs Strava/TrainingPeaks: la potenza massimale DOPO "
+                   "aver accumulato lavoro. Ha senso solo se dopo la soglia hai fatto sforzi intensi.")
+        kj_thr = st.slider("Soglia kJ per 'da stanco'", 500, 4000, 2000, 250)
+        dur = ca.durability(power, kj_threshold=kj_thr)
+        if dur["reached"]:
+            drows = [{"Durata": {5:"5s",15:"15s",60:"1min",300:"5min",1200:"20min"}.get(d, f"{d}s"),
+                      "Da fresco (W)": v["fresh"], "Da stanco (W)": v["fatigued"],
+                      "Caduta %": f"{v['drop_pct']}%"} for d, v in dur["per_duration"].items()]
+            st.dataframe(pd.DataFrame(drows), hide_index=True, use_container_width=True)
+            st.caption(f"kJ totali dell'uscita: {dur['total_kj']:.0f}. "
+                       f"{badge(dur['confidence'])} — caduta bassa = ottima resistenza alla fatica.",
+                       unsafe_allow_html=True)
+        else:
+            st.info(f"Uscita troppo corta: {dur['total_kj']:.0f} kJ totali, sotto la soglia di "
+                    f"{kj_thr} kJ. Abbassa la soglia o analizza un'uscita più lunga.")
+
+        st.divider()
+        st.markdown("#### 🎯 Intervalli rilevati automaticamente")
+        ivs = ti.detect_intervals(power, ftp_val)
+        if ivs:
+            irows = [{"#": k, "Inizio": f"{iv['start_s']//60}:{iv['start_s']%60:02d}",
+                      "Durata": f"{iv['duration_s']//60}:{iv['duration_s']%60:02d}",
+                      "Media (W)": iv["avg_power"], "% FTP": f"{iv['pct_ftp']}%",
+                      "Picco (W)": iv["peak_power"]} for k, iv in enumerate(ivs, 1)]
+            st.dataframe(pd.DataFrame(irows), hide_index=True, use_container_width=True)
+            st.caption(f"{len(ivs)} sforzi sopra il 102% FTP per ≥20 s (micro-cali uniti). "
+                       "Ricostruisce la struttura dell'allenamento senza inserirla a mano.")
+        else:
+            st.info("Nessuno sforzo intenso rilevato (uscita perlopiù aerobica costante).")
     else:
         st.info("Servono potenza e stima CP per l'analisi della sessione.")
 
@@ -557,13 +589,14 @@ with tabs[8]:
                     acts = ca.list_intervals_activities(creds["aid"], creds["key"],
                                                         days_back=days, limit=2000)
                 st.session_state["season_acts"] = acts
-                pw = [a for a in acts if a.get("has_power")][:maxact]
-                prog = st.progress(0.0, text=f"Scarico gli streams di {len(pw)} attività...")
-                season, used = ca.season_power_curve_from_intervals(
-                    creds["aid"], creds["key"], [a["id"] for a in pw],
+                npw = len([a for a in acts if a.get("has_power")][:maxact])
+                prog = st.progress(0.0, text=f"Scarico e analizzo {npw} attività...")
+                res = ti.analyze_season_from_intervals(
+                    athlete, creds["aid"], creds["key"], acts, max_activities=maxact,
                     progress_cb=lambda f: prog.progress(min(f, 1.0)))
-                st.session_state["season_curve"] = season
-                st.session_state["season_used"] = used
+                st.session_state["season_curve"] = res["season_curve"]
+                st.session_state["season_used"] = res["used"]
+                st.session_state["season_trends"] = res["trends"]
                 prog.empty()
             except Exception as e:
                 st.error(f"Errore durante il caricamento: {e}")
@@ -643,6 +676,30 @@ with tabs[8]:
                 else:
                     st.info("Nella finestra scelta mancano sforzi massimali tra 2 e 20 min per "
                             "stimare CP / FTP / VO2max in modo affidabile. Prova ad allargare la finestra.")
+
+            trends = st.session_state.get("season_trends")
+            if trends is not None and len(trends):
+                st.divider()
+                st.markdown("#### 📈 Trend nel tempo (il film, non la foto)")
+                st.caption("Stai migliorando? eFTP e VO2max stimate per uscita, e decoupling "
+                           "(più basso = più efficiente). Ogni punto è un'uscita.")
+                specs = [("eftp", "eFTP stimata", "#0A45FA", "W"),
+                         ("vo2max", "VO2max stimata", "#2e9e5b", "mL/kg/min"),
+                         ("decoupling", "Decoupling Pw:Hr", "#E08A00", "%")]
+                tc = st.columns(3)
+                for col, (field, title, color, unit) in zip(tc, specs):
+                    sub = trends.dropna(subset=[field])
+                    with col:
+                        if len(sub) >= 2:
+                            fig = go.Figure(go.Scatter(
+                                x=sub["date"], y=sub[field], mode="markers+lines",
+                                line=dict(color=color, width=1.5), marker=dict(size=5)))
+                            fig.update_layout(height=230, margin=dict(l=0, r=0, t=32, b=0),
+                                title=dict(text=f"{title} ({unit})", font=dict(size=13)),
+                                showlegend=False)
+                            st.plotly_chart(fig, use_container_width=True, key=f"trend_{field}")
+                        else:
+                            st.caption(f"{title}: dati insufficienti.")
 
 # ---- footer legenda ------------------------------------------------------- #
 st.divider()
