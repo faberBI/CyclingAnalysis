@@ -100,8 +100,17 @@ try:
         if up: raw = ca.load_csv(up)
     else:
         key = st.sidebar.text_input("API key intervals.icu", type="password")
-        act = st.sidebar.text_input("Activity ID (es. i123456)")
-        if key and act: raw = ca.load_intervals_icu(act, key)
+        aid = st.sidebar.text_input("ID atleta (es. i382978, oppure 0)", value="0",
+                                    help="Lo trovi in Impostazioni sviluppatore. '0' = atleta della chiave.")
+        if key and aid:
+            acts = ca.list_intervals_activities(aid, key)
+            if acts:
+                labels = {f"{a['date']} · {a['name'] or a['type']}  ({a['id']})": a["id"]
+                          for a in acts}
+                choice = st.sidebar.selectbox("Scegli un'attività", list(labels.keys()))
+                raw = ca.load_intervals_icu(labels[choice], key)
+            else:
+                st.sidebar.info("Nessuna attività trovata negli ultimi mesi.")
 except Exception as e:
     st.sidebar.error(f"Errore caricamento: {e}")
 
