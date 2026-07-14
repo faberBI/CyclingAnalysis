@@ -188,6 +188,34 @@ class Session:
     frac_high: float = 0.0    # Z5+
 
 
+def polarization_from_hist(edges, counts, ftp: float) -> dict:
+    """
+    Distribuzione di intensita' (modello 3-zone di Seiler) da un istogramma di potenza.
+    Low = <80% FTP (LIT/aerobico), Mid = 80-105% FTP (soglia/'zona grigia'),
+    High = >105% FTP (HIT). Counts sono secondi (1 Hz) -> ore per fascia + % + etichetta.
+    """
+    edges = np.asarray(edges, dtype=float)
+    counts = np.asarray(counts, dtype=float)
+    centers = (edges[:-1] + edges[1:]) / 2
+    lo_thr, hi_thr = 0.80 * ftp, 1.05 * ftp
+    low = counts[centers < lo_thr].sum()
+    mid = counts[(centers >= lo_thr) & (centers < hi_thr)].sum()
+    high = counts[centers >= hi_thr].sum()
+    total = (low + mid + high) or 1
+    pl, pm, ph = low / total * 100, mid / total * 100, high / total * 100
+    if pl >= 75 and pm < 20:
+        label = "Polarizzata (80/20) — buono"
+    elif pm > 35:
+        label = "Troppa 'zona grigia' (soglia)"
+    elif ph > 35:
+        label = "Molto intensa"
+    else:
+        label = "Prevalentemente aerobica"
+    return {"low_h": low / 3600, "mid_h": mid / 3600, "high_h": high / 3600,
+            "pct_low": round(pl), "pct_mid": round(pm), "pct_high": round(ph),
+            "label": label, "confidence": Confidence.ESTIMATED}
+
+
 def pmc_from_activities(activities: list[dict]) -> pd.DataFrame:
     """
     Costruisce il PMC (CTL/ATL/TSB) su TUTTO lo storico a partire dall'elenco
@@ -749,6 +777,8 @@ def analyze_season_from_intervals(athlete, athlete_id: str, api_key: str,
     acts = [a for a in activities if a.get("has_power")][:max_activities]
     curves, fatigued_curves, rows, used, n_durable = [], [], [], 0, 0
     dur_durations = [5, 15, 60, 300, 1200]
+    hist_edges = np.arange(0, 1610, 10)                    # bin di 10 W fino a 1600 W
+    hist_counts = np.zeros(len(hist_edges) - 1)            # secondi (a 1 Hz) per bin
     n = len(acts) or 1
     for i, a in enumerate(acts):
         try:
@@ -757,6 +787,7 @@ def analyze_season_from_intervals(athlete, athlete_id: str, api_key: str,
                 power = df1["power"].values
                 mmp_a = ca.mean_maximal_power(power)
                 curves.append(mmp_a)
+                hist_counts += np.histogram(np.nan_to_num(power), bins=hist_edges)[0]
                 # curva da stanco: MMP del tratto dopo kj_threshold kJ
                 cum = np.cumsum(power) / 1000.0
                 idx = int(np.searchsorted(cum, kj_threshold))
@@ -767,13 +798,17 @@ def analyze_season_from_intervals(athlete, athlete_id: str, api_key: str,
                         else 0.90 * mmp_a[480] if 480 in mmp_a.index else np.nan)
                 vo2 = (ca.estimate_vo2max(athlete, mmp_a[300])["vo2max"].value
                        if 300 in mmp_a.index else np.nan)
-                dec = np.nan
+                dec = ef = np.nan
                 if "hr" in df1.columns and df1["hr"].notna().any():
-                    dec = aerobic_decoupling(power, df1["hr"].values).value
+                    hr = df1["hr"].values
+                    dec = aerobic_decoupling(power, hr).value
+                    mean_hr = float(np.nanmean(hr))
+                    ef = ca.normalized_power(power) / mean_hr if mean_hr else np.nan
                 rows.append({"date": a.get("date"),
                              "eftp": round(float(eftp)) if eftp == eftp else np.nan,
                              "vo2max": round(float(vo2), 1) if vo2 == vo2 else np.nan,
                              "decoupling": round(float(dec), 1) if dec == dec else np.nan,
+                             "ef": round(float(ef), 2) if ef == ef else np.nan,
                              "tss": a.get("load") or np.nan})
                 used += 1
         except Exception:
@@ -801,4 +836,5 @@ def analyze_season_from_intervals(athlete, athlete_id: str, api_key: str,
         trends = trends.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
     return {"season_curve": season, "season_fatigued": season_fat,
             "durability": durability, "n_durable": n_durable,
-            "kj_threshold": kj_threshold, "trends": trends, "used": used}
+            "kj_threshold": kj_threshold, "trends": trends, "used": used,
+            "power_hist": {"edges": hist_edges.tolist(), "counts": hist_counts.tolist()}}
