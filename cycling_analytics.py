@@ -752,6 +752,37 @@ def load_intervals_icu(activity_id: str, api_key: str) -> pd.DataFrame:
     return _resolve_columns(df)
 
 
+def list_intervals_activities(athlete_id: str, api_key: str,
+                              days_back: int = 120, limit: int = 40) -> list[dict]:
+    """
+    Elenca le attivita' recenti di un atleta su intervals.icu (per sceglierne una).
+    athlete_id: il tuo ID atleta (es. "i382978") oppure "0" = atleta della chiave.
+    Ritorna una lista di {id, name, date, type} ordinata dalla piu' recente.
+    Endpoint: GET /api/v1/athlete/{id}/activities?oldest=...&newest=...
+    NB: stesso schema auth + User-Agent browser (Cloudflare) di load_intervals_icu.
+    Non testato contro l'API live da qui: se i nomi dei campi differissero, segnala
+    cosa restituisce e allineo il parsing.
+    """
+    import requests
+    from datetime import date, timedelta
+    url = f"https://intervals.icu/api/v1/athlete/{athlete_id}/activities"
+    headers = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0 Safari/537.36")}
+    params = {"oldest": (date.today() - timedelta(days=days_back)).isoformat(),
+              "newest": date.today().isoformat()}
+    r = requests.get(url, auth=("API_KEY", api_key), headers=headers,
+                     params=params, timeout=30)
+    r.raise_for_status()
+    acts = r.json()
+    rows = [{"id": a.get("id"),
+             "name": a.get("name") or "",
+             "date": (a.get("start_date_local") or a.get("start_date") or "")[:10],
+             "type": a.get("type") or ""} for a in acts if a.get("id")]
+    rows.sort(key=lambda x: x["date"], reverse=True)
+    return rows[:limit]
+
+
 # --------------------------------------------------------------------------- #
 # 12. TASSONOMIA COMPLETA DEL CORRIDORE                                        #
 # --------------------------------------------------------------------------- #
