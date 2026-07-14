@@ -613,17 +613,19 @@ def detect_intervals(power, ftp: float, min_seconds: int = 20,
 # --------------------------------------------------------------------------- #
 def analyze_season_from_intervals(athlete, athlete_id: str, api_key: str,
                                   activities: list[dict], progress_cb=None,
-                                  max_activities: int = 60) -> dict:
+                                  max_activities: int = 60,
+                                  kj_threshold: float = 2000) -> dict:
     """
     Un'unica passata sugli streams delle attivita' (una chiamata /streams ciascuna):
-    costruisce la curva di potenza stagionale E la serie temporale di eFTP, VO2max
-    stimata e decoupling per uscita (il 'film', non la foto). Ritorna
-    {season_curve, trends(DataFrame date/eftp/vo2max/decoupling/tss), used}.
+    costruisce (1) la curva di potenza stagionale, (2) la curva 'da stanco' aggregata
+    (durability su piu' uscite), (3) la serie temporale di eFTP, VO2max stimata e
+    decoupling per uscita. Ritorna un dict con tutto.
     """
     import time as _time
     import cycling_analytics as ca
     acts = [a for a in activities if a.get("has_power")][:max_activities]
-    curves, rows, used = [], [], 0
+    curves, fatigued_curves, rows, used, n_durable = [], [], [], 0, 0
+    dur_durations = [5, 15, 60, 300, 1200]
     n = len(acts) or 1
     for i, a in enumerate(acts):
         try:
@@ -632,6 +634,12 @@ def analyze_season_from_intervals(athlete, athlete_id: str, api_key: str,
                 power = df1["power"].values
                 mmp_a = ca.mean_maximal_power(power)
                 curves.append(mmp_a)
+                # curva da stanco: MMP del tratto dopo kj_threshold kJ
+                cum = np.cumsum(power) / 1000.0
+                idx = int(np.searchsorted(cum, kj_threshold))
+                if idx < len(power):
+                    fatigued_curves.append(ca.mean_maximal_power(power[idx:], dur_durations))
+                    n_durable += 1
                 eftp = (0.95 * mmp_a[1200] if 1200 in mmp_a.index
                         else 0.90 * mmp_a[480] if 480 in mmp_a.index else np.nan)
                 vo2 = (ca.estimate_vo2max(athlete, mmp_a[300])["vo2max"].value
@@ -650,10 +658,24 @@ def analyze_season_from_intervals(athlete, athlete_id: str, api_key: str,
         if progress_cb:
             progress_cb((i + 1) / n)
         _time.sleep(0.12)
+
     season = (pd.concat(curves, axis=1).max(axis=1).rename("mmp_watt")
               if curves else pd.Series(dtype=float))
+    season_fat = (pd.concat(fatigued_curves, axis=1).max(axis=1)
+                  if fatigued_curves else pd.Series(dtype=float))
+    # durability aggregata: caduta fresco -> stanco sulle curve stagionali
+    durability = {}
+    for d in dur_durations:
+        f = season.get(d)
+        g = season_fat.get(d) if len(season_fat) else None
+        if f and g:
+            durability[d] = {"fresh": round(f), "fatigued": round(g),
+                             "drop_pct": round((f - g) / f * 100, 1)}
+
     trends = pd.DataFrame(rows)
     if len(trends):
         trends["date"] = pd.to_datetime(trends["date"], errors="coerce")
         trends = trends.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-    return {"season_curve": season, "trends": trends, "used": used}
+    return {"season_curve": season, "season_fatigued": season_fat,
+            "durability": durability, "n_durable": n_durable,
+            "kj_threshold": kj_threshold, "trends": trends, "used": used}
