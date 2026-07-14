@@ -721,15 +721,24 @@ def load_fit(file) -> pd.DataFrame:
 
 def load_intervals_icu(activity_id: str, api_key: str) -> pd.DataFrame:
     """
-    Streams da intervals.icu via API.
-    Auth: HTTP Basic con username='API_KEY' e password=la tua chiave (schema intervals.icu).
-    NB: non testato contro l'API live in questo ambiente (dominio non raggiungibile);
-    verifica con la tua chiave. Docs: https://intervals.icu/api-docs.html
+    Streams (serie temporali a 1 Hz) di un'attivita' da intervals.icu.
+    Auth: HTTP Basic, username letterale 'API_KEY', password = la tua chiave.
+    L'activity_id e' nell'URL dell'attivita' (es. .../activities/i12345 -> "i12345").
+    Endpoint: GET /api/v1/activity/{id}/streams
+
+    NB Cloudflare: intervals.icu e' dietro Cloudflare, che blocca lo User-Agent di
+    default di requests/urllib. Serve uno UA da browser (impostato sotto), altrimenti
+    ricevi 403. Limiti chiave personale: 5000 richieste/giorno (solo uso personale;
+    per multi-utente serve OAuth + Bearer token). Docs: https://intervals.icu/api-docs.html
     """
     import requests
     url = f"https://intervals.icu/api/v1/activity/{activity_id}/streams"
-    r = requests.get(url, auth=("API_KEY", api_key),
-                     params={"types": "time,watts,heartrate,cadence,velocity_smooth,altitude"})
+    headers = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0 Safari/537.36")}
+    r = requests.get(url, auth=("API_KEY", api_key), headers=headers,
+                     params={"types": "time,watts,heartrate,cadence,velocity_smooth,altitude"},
+                     timeout=30)
     r.raise_for_status()
     streams = {s["type"]: s["data"] for s in r.json()}
     df = pd.DataFrame({
