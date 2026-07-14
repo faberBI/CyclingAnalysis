@@ -93,22 +93,46 @@ STD_COLS = ["t", "power", "hr", "cadence", "speed", "altitude"]
 def to_1hz(df: pd.DataFrame, time_col: str = "t") -> pd.DataFrame:
     """
     Ricampiona a 1 secondo. La curva di potenza e tutto il resto assumono 1 Hz.
-    `t` puo' essere secondi (int/float) o datetime. Gap brevi -> interpolati;
-    gap lunghi (stop) -> power=0.
+    `t` puo' essere secondi (int/float), timestamp epoch o datetime/stringhe ISO.
+    Robusto a colonne 'object' (testo/misto): tutte le colonne numeriche vengono
+    forzate con to_numeric (i valori non validi diventano NaN e vengono interpolati).
+    Gap brevi -> interpolati; gap lunghi (stop) -> power=0.
     """
     d = df.copy()
-    if np.issubdtype(d[time_col].dtype, np.datetime64):
-        d["_sec"] = (d[time_col] - d[time_col].iloc[0]).dt.total_seconds()
+
+    # --- asse temporale in secondi dall'inizio (robusto) ---
+    tcol = d[time_col]
+    if pd.api.types.is_datetime64_any_dtype(tcol):
+        sec = (tcol - tcol.iloc[0]).dt.total_seconds()
     else:
-        d["_sec"] = d[time_col] - d[time_col].iloc[0]
+        num = pd.to_numeric(tcol, errors="coerce")
+        if num.notna().sum() >= max(2, 0.5 * len(num)):        # secondi / epoch numerici
+            sec = num - num.dropna().iloc[0]
+        else:                                                  # prova stringhe datetime ISO
+            dt = pd.to_datetime(tcol, errors="coerce", utc=True)
+            if dt.notna().sum() < 2:
+                raise ValueError("Colonna tempo non interpretabile (né numerica né datetime).")
+            sec = (dt - dt.dropna().iloc[0]).dt.total_seconds()
+
+    d = d.drop(columns=[time_col], errors="ignore")
+    d["_sec"] = pd.to_numeric(sec, errors="coerce")
+    d = d.dropna(subset=["_sec"])
+    if len(d) == 0:
+        raise ValueError("Nessun timestamp valido nei dati.")
     d["_sec"] = d["_sec"].round().astype(int)
     d = d.drop_duplicates("_sec").set_index("_sec")
     full = pd.RangeIndex(0, int(d.index.max()) + 1)
     d = d.reindex(full)
-    if "power" in d:
+
+    # --- forza numerico su TUTTE le colonne dati prima di interpolare ---
+    for c in ["power", "hr", "cadence", "speed", "altitude"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    if "power" in d.columns:
         d["power"] = d["power"].interpolate(limit=3).fillna(0).clip(lower=0)
     for c in ["hr", "cadence", "speed", "altitude"]:
-        if c in d:
+        if c in d.columns:
             d[c] = d[c].interpolate(limit=5)
     d.index.name = "t"
     return d
@@ -898,3 +922,35 @@ def rider_type_full(mmp: pd.Series, mass_kg: float) -> dict:
         "relative_strengths": rel,
         "confidence": Confidence.ESTIMATED,
     }
+
+
+# --------------------------------------------------------------------------- #
+# 13. DURABILITY / RESISTENZA ALLA FATICA  —  MEASURED                         #
+# --------------------------------------------------------------------------- #
+def durability(power, durations=(5, 15, 60, 300, 1200), kj_threshold: float = 2000):
+    """
+    Il differenziatore vs Strava/TrainingPeaks: la curva di potenza DA STANCO.
+    Confronta la potenza massimale 'da fresco' (tutta l'uscita) con quella calcolata
+    SOLO dopo aver accumulato `kj_threshold` kJ di lavoro. La caduta % a ogni durata
+    misura quanto reggi con le gambe pesanti (fatigue resistance).
+
+    CAVEAT onesto: ha senso solo se DOPO la soglia hai fatto sforzi (quasi) massimali;
+    se dopo 2000 kJ hai solo pedalato piano, la 'caduta' e' un artefatto. Su singola
+    uscita e' indicativo; il quadro vero emerge aggregando piu' uscite lunghe.
+    """
+    p = np.nan_to_num(np.asarray(power, dtype=float), nan=0.0)
+    cum_kj = np.cumsum(p) / 1000.0
+    idx = int(np.searchsorted(cum_kj, kj_threshold))
+    out = {"kj_threshold": kj_threshold, "reached": idx < len(p),
+           "total_kj": round(float(cum_kj[-1]), 0) if len(cum_kj) else 0,
+           "confidence": Confidence.MEASURED, "per_duration": {}}
+    if not out["reached"]:
+        return out
+    fresh = mean_maximal_power(p, list(durations))
+    fatigued = mean_maximal_power(p[idx:], list(durations))
+    for dsec in durations:
+        f, g = fresh.get(dsec), fatigued.get(dsec)
+        if f and g:
+            out["per_duration"][dsec] = {"fresh": round(f), "fatigued": round(g),
+                                         "drop_pct": round((f - g) / f * 100, 1)}
+    return out
