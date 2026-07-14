@@ -370,6 +370,12 @@ elif mode.startswith("📊"):
                     max_activities=maxact, kj_threshold=kj_thr,
                     progress_cb=lambda f: prog.progress(min(f, 1.0)))
             st.session_state["season"] = res
+            # Wellness (HRV / HR a riposo / sonno) per il recupero autonomico
+            try:
+                well = ca.load_intervals_wellness(creds["aid"], creds["key"], days_back=60)
+                st.session_state["readiness"] = ti.wellness_readiness(well)
+            except Exception:
+                st.session_state["readiness"] = None
             prog.empty()
         except Exception as e:
             st.error(f"Errore durante il caricamento: {e}")
@@ -404,22 +410,44 @@ elif mode.startswith("📊"):
 
     # -- Cruscotto: stato + profilo a colpo d'occhio --
     with stabs[0]:
+        readiness = st.session_state.get("readiness")
         st.markdown("#### Stato di forma e recupero")
         if state:
             tsb = state["tsb"]
             fcol = ("#2e9e5b" if tsb > 5 else "#0C1623" if tsb > -10
                     else "#E08A00" if tsb > -30 else "#B0392E")
+            base_rd = state["rec_days"]
+            adj_rd = ti.adjusted_recovery_days(base_rd, readiness)
             sc = st.columns(4)
             state_card(sc[0], "Forma (TSB)", f"{tsb:+.0f}", ti.tsb_label(tsb), color=fcol)
-            state_card(sc[1], "Recupero", ti.recovery_status(tsb), "stato attuale", size="1.3rem")
-            rd = state["rec_days"]
-            state_card(sc[2], "Recupero in giorni", "già fresco" if rd == 0 else f"~{rd} gg",
-                       "riposo stimato per TSB ≥ +5")
+            state_card(sc[1], "Recupero", ti.recovery_status(tsb), "stato (da carico)", size="1.3rem")
+            rd_sub = "riposo per TSB ≥ +5"
+            rd_color = "#0C1623"
+            if readiness and readiness.get("have_data") and adj_rd != base_rd:
+                rd_sub = f"carico {base_rd} + wellness +{adj_rd-base_rd}"
+                rd_color = "#B0392E"
+            state_card(sc[2], "Recupero in giorni",
+                       "già fresco" if adj_rd == 0 else f"~{adj_rd} gg", rd_sub, color=rd_color)
             state_card(sc[3], "Fitness / Fatica", f"{state['ctl']:.0f} / {state['atl']:.0f}", "CTL / ATL")
-            st.caption(f"Stima su modello (Banister/Coggan) {badge(Confidence.ESTIMATED)} — "
-                       "non tiene conto di sonno/HRV.", unsafe_allow_html=True)
         else:
             st.info("Dati insufficienti per lo stato di forma.")
+
+        # Recupero autonomico (wellness)
+        if readiness and readiness.get("have_data"):
+            ov = readiness["overall"]
+            ocolor = {"verde": "#2e9e5b", "ambra": "#E08A00", "rosso": "#B0392E"}.get(ov, "#0C1623")
+            st.markdown("**Recupero autonomico (wellness)**")
+            wc = st.columns(4)
+            state_card(wc[0], "Prontezza", ov.upper(), "HRV + HR riposo + sonno", color=ocolor, size="1.3rem")
+            state_card(wc[1], "HRV", readiness["hrv"], "vs baseline")
+            state_card(wc[2], "HR a riposo", readiness["rhr"], "vs baseline")
+            state_card(wc[3], "Sonno", readiness["sleep"], "ultimi giorni")
+            st.caption(f"{readiness['flag']} {badge(Confidence.ESTIMATED)} — HRV-guided (soglie di popolazione).",
+                       unsafe_allow_html=True)
+        else:
+            st.caption(f"Recupero stimato dal SOLO carico (TSB) {badge(Confidence.ESTIMATED)}. Con dati "
+                       "wellness (HRV / HR a riposo / sonno) su intervals.icu il recupero si affina.",
+                       unsafe_allow_html=True)
 
         st.divider()
         st.markdown("#### Profilo (dalla curva di potenza su tutte le uscite)")
@@ -624,7 +652,8 @@ else:
             rt_rec = ca.rider_type_full(st.session_state["season"]["season_curve"], mass) \
                 if st.session_state.get("season") and len(st.session_state["season"]["season_curve"]) \
                 else (ca.rider_type_full(mmp, mass) if (has_power and len(mmp)) else {})
-            rec = ti.recommend_next_workout(pmc, ws, rt_rec, ftp_val or 250, target=target)
+            rec = ti.recommend_next_workout(pmc, ws, rt_rec, ftp_val or 250, target=target,
+                                            readiness=st.session_state.get("readiness"))
             st.markdown("#### 🎯 Allenamento consigliato per la prossima uscita")
             r = rec["recommended"]
             st.success(f"**{r['name']}** — {r['prescription']}  · _{r['expected_tss']}_")
