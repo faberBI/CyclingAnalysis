@@ -988,3 +988,92 @@ def load_intervals_wellness(athlete_id: str, api_key: str, days_back: int = 60) 
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
     return df
+
+
+# --------------------------------------------------------------------------- #
+# 15. CURVA DI OSSIDAZIONE DEI GRASSI (ottimizzazione consumo grassi)          #
+# --------------------------------------------------------------------------- #
+def fat_oxidation_curve(map_watt: float, athlete: "Athlete", n: int = 60) -> dict:
+    """
+    Curva di ossidazione grassi vs intensita' (MODELLATO). Per una griglia di potenze
+    stima g/min di grassi e carboidrati con lo stesso modello logistico di
+    substrate_split + il dispendio energetico a quella potenza. Il PICCO della curva
+    dei grassi = FatMax (potenza di massimo consumo di grassi): a che intensita'
+    ottimizzi il consumo di grassi.
+
+    A bassa intensita' bruci soprattutto grassi ma poca energia totale -> pochi g/min;
+    ad alta intensita' spendi tanto ma quasi solo carboidrati -> pochi grassi. Il
+    massimo sta nel mezzo.
+
+    ONESTA': senza analisi dei gas espirati e' un modello di POPOLAZIONE; il tuo FatMax
+    reale puo' variare di 10-15 %VO2max. Per il valore vero serve un test incrementale
+    con metabolimetro (o passa athlete.fatmax_pct_vo2max se l'hai misurato).
+    """
+    watts = np.linspace(0.20 * map_watt, 1.10 * map_watt, n)
+    x0 = athlete.fatmax_pct_vo2max / 100 if athlete.fatmax_pct_vo2max else 0.62
+    k = 9.0
+    rows = []
+    for w in watts:
+        intensity = float(np.clip(w / map_watt, 0, 1.4))
+        pct_cho = 1.0 / (1.0 + np.exp(-k * (intensity - x0)))
+        pct_fat = 1.0 - pct_cho
+        kcal_min = (w * 60 / 1000) / 0.24 / 4.184        # dispendio energetico a quella potenza
+        rows.append({"watt": round(w),
+                     "pct_intensity": round(intensity * 100),
+                     "fat_g_min": kcal_min * pct_fat / 9.5,
+                     "cho_g_min": kcal_min * pct_cho / 4.0})
+    df = pd.DataFrame(rows)
+    imax = int(df["fat_g_min"].idxmax())
+    return {"curve": df,
+            "fatmax_watt": float(df.loc[imax, "watt"]),
+            "fatmax_pct": float(df.loc[imax, "pct_intensity"]),
+            "fatmax_fat_g_min": float(df.loc[imax, "fat_g_min"]),
+            "confidence": Confidence.MODELED,
+            "note": "Modello di popolazione: per il FatMax vero serve un test con metabolimetro."}
+
+
+# --------------------------------------------------------------------------- #
+# 16. CONFRONTO CON I PRO (+ Pogacar) E CLASSIFICA AMATORI                     #
+# --------------------------------------------------------------------------- #
+# Stime W/kg di Pogacar da analisi di potenza sulle salite (Portoleau/Grappe-style),
+# NON dati ufficiali di laboratorio. Da prendere per quello che sono: ordini di
+# grandezza per un confronto divertente.
+POGACAR_WKG = {5: 22.5, 60: 13.0, 300: 7.8, 1200: 6.9}
+
+def pro_comparison(mmp: pd.Series, mass_kg: float) -> dict:
+    """Confronto W/kg dell'atleta vs Continental / Professional / World Tour / Pogacar."""
+    durs = {5: "Sprint 5s", 60: "1 min", 300: "5 min", 1200: "20 min"}
+    rows = []
+    for d, label in durs.items():
+        if d in mmp.index and d in RIDER_BENCHMARKS_M:
+            wkg = mmp[d] / mass_kg
+            pog = POGACAR_WKG.get(d)
+            rows.append({"durata": label, "dur_s": d, "tu": round(wkg, 2),
+                         "continental": RIDER_BENCHMARKS_M[d]["continental"],
+                         "professional": RIDER_BENCHMARKS_M[d]["professional"],
+                         "world_tour": RIDER_BENCHMARKS_M[d]["world_tour"],
+                         "pogacar": pog,
+                         "pct_pogacar": round(wkg / pog * 100) if pog else None})
+    return {"rows": rows, "confidence": Confidence.ESTIMATED,
+            "note": ("Valori pro e Pogacar sono STIME da analisi di potenza sulle salite, "
+                     "non dati ufficiali. Solo per confronto indicativo (e divertente).")}
+
+# Fasce amatoriali su FTP/20-min W/kg (uomini, approssimative). low/middle/top.
+AMATEUR_BANDS = [
+    ("Amatore base (low)",       0.0, 3.1),
+    ("Amatore intermedio (mid)", 3.1, 3.8),
+    ("Amatore avanzato (top)",   3.8, 4.5),
+    ("Agonista / Elite amat.",   4.5, 99.0),
+]
+
+def classify_amateur(ftp_wkg: float) -> dict:
+    """Colloca l'atleta tra gli amatori: base(low) / intermedio(mid) / avanzato(top)."""
+    tier = "n/d"
+    for name, lo, hi in AMATEUR_BANDS:
+        if lo <= ftp_wkg < hi:
+            tier = name
+            break
+    # posizione 0-1 sulla scala amatoriale complessiva (~2.0 -> 4.5 W/kg)
+    pos = min(1.0, max(0.0, (ftp_wkg - 2.0) / (4.5 - 2.0)))
+    return {"tier": tier, "ftp_wkg": round(ftp_wkg, 2), "position": pos,
+            "bands": AMATEUR_BANDS, "confidence": Confidence.ESTIMATED}
