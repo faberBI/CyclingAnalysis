@@ -47,6 +47,13 @@ def metric_card(col, title, m, big=True):
         f"<div style='font-size:.68rem;color:#8a939f;margin-top:3px'>{m.method}</div></div>",
         unsafe_allow_html=True)
 
+def state_card(col, title, value, sub, color="#0C1623", size="1.7rem"):
+    col.markdown(
+        f"<div style='line-height:1.25'><div style='font-size:.8rem;color:#5b6470'>{title}</div>"
+        f"<div style='font-size:{size};font-weight:800;color:{color}'>{value}</div>"
+        f"<div style='font-size:.7rem;color:#8a939f;margin-top:3px'>{sub}</div></div>",
+        unsafe_allow_html=True)
+
 # --------------------------------------------------------------------------- #
 #  Dati demo                                                                  #
 # --------------------------------------------------------------------------- #
@@ -374,10 +381,64 @@ elif mode.startswith("📊"):
         st.stop()
 
     season = res["season_curve"] if res else pd.Series(dtype=float)
-    stabs = st.tabs(["📊 Panoramica", "📈 Curva & Profilo", "🔋 Durability", "🏆 Classificazione", "📉 Trend"])
 
-    # -- Panoramica --
+    # --- calcolo UNA VOLTA: forma/recupero (PMC) e profilo (curva aggregata) ---
+    pmc = ti.pmc_from_activities(acts)
+    state = None
+    if len(pmc):
+        ctl_now = float(pmc["ctl"].iloc[-1]); atl_now = float(pmc["atl"].iloc[-1])
+        tsb_now = float(pmc["tsb"].iloc[-1])
+        state = {"ctl": ctl_now, "atl": atl_now, "tsb": tsb_now,
+                 "rec_days": ti.recovery_forecast(ctl_now, atl_now)}
+    profile = None
+    if res and len(season) and len(season[(season.index >= 120) & (season.index <= 1200)]) >= 3:
+        _cp = ca.critical_power(season, model="3param")
+        _ftp = ca.estimate_ftp(season, cp=_cp["cp"].value)
+        _map = ca.maximal_aerobic_power(season)
+        _vo2 = ca.estimate_vo2max(athlete, _map.value)
+        _fm = ca.fatmax(_map.value, athlete)
+        profile = {"cp": _cp, "ftp": _ftp, "map": _map, "vo2": _vo2, "fatmax": _fm}
+
+    stabs = st.tabs(["🧭 Cruscotto", "📈 Curva & Profilo", "🔋 Durability",
+                     "🏆 Classificazione", "📉 Trend"])
+
+    # -- Cruscotto: stato + profilo a colpo d'occhio --
     with stabs[0]:
+        st.markdown("#### Stato di forma e recupero")
+        if state:
+            tsb = state["tsb"]
+            fcol = ("#2e9e5b" if tsb > 5 else "#0C1623" if tsb > -10
+                    else "#E08A00" if tsb > -30 else "#B0392E")
+            sc = st.columns(4)
+            state_card(sc[0], "Forma (TSB)", f"{tsb:+.0f}", ti.tsb_label(tsb), color=fcol)
+            state_card(sc[1], "Recupero", ti.recovery_status(tsb), "stato attuale", size="1.3rem")
+            rd = state["rec_days"]
+            state_card(sc[2], "Recupero in giorni", "già fresco" if rd == 0 else f"~{rd} gg",
+                       "riposo stimato per TSB ≥ +5")
+            state_card(sc[3], "Fitness / Fatica", f"{state['ctl']:.0f} / {state['atl']:.0f}", "CTL / ATL")
+            st.caption(f"Stima su modello (Banister/Coggan) {badge(Confidence.ESTIMATED)} — "
+                       "non tiene conto di sonno/HRV.", unsafe_allow_html=True)
+        else:
+            st.info("Dati insufficienti per lo stato di forma.")
+
+        st.divider()
+        st.markdown("#### Profilo (dalla curva di potenza su tutte le uscite)")
+        if profile:
+            pc = st.columns(5)
+            metric_card(pc[0], "FTP", profile["ftp"]["ftp_recommended"])
+            metric_card(pc[1], "VO2max", profile["vo2"]["vo2max"])
+            metric_card(pc[2], "W'", ca.Metric(profile["cp"]["w_prime"].value/1000, "kJ",
+                        profile["cp"]["w_prime"].confidence, profile["cp"]["w_prime"].method), big=False)
+            metric_card(pc[3], "MAP", profile["map"])
+            metric_card(pc[4], "FatMax", profile["fatmax"])
+            st.caption("Curva di potenza, CP e dispersione FTP → scheda 📈 Curva & Profilo · "
+                       "Durability → 🔋 · Che corridore sei → 🏆")
+        else:
+            st.info("Servono sforzi massimali 2-20 min nella finestra scelta per il profilo (FTP/VO2max/W'). "
+                    "Allarga la finestra e ri-analizza.")
+
+        st.divider()
+        st.markdown("#### Volume del periodo")
         n = len(acts)
         tot_tss = sum(a.get("load") or 0 for a in acts)
         tot_h = sum(a.get("moving_time") or 0 for a in acts) / 3600
@@ -387,7 +448,7 @@ elif mode.startswith("📊"):
         m[1].metric("Ore totali", f"{tot_h:.0f}")
         m[2].metric("Distanza", f"{tot_km:,.0f} km")
         m[3].metric("TSS totale", f"{tot_tss:,.0f}")
-        pmc = ti.pmc_from_activities(acts)
+
         if len(pmc):
             st.markdown("#### Forma nel tempo — tutta la storia (CTL / ATL / TSB)")
             px = pd.to_datetime(pmc["day"])
@@ -395,12 +456,9 @@ elif mode.startswith("📊"):
             fig.add_trace(go.Scatter(x=px, y=pmc["ctl"], name="Fitness (CTL)", line=dict(color="#0A45FA", width=2.5)))
             fig.add_trace(go.Scatter(x=px, y=pmc["atl"], name="Fatica (ATL)", line=dict(color="#B0392E", width=1.2, dash="dot")))
             fig.add_trace(go.Scatter(x=px, y=pmc["tsb"], name="Forma (TSB)", line=dict(color="#2e9e5b", width=1.2), yaxis="y2"))
-            fig.update_layout(height=340, margin=dict(l=0,r=0,t=10,b=0), yaxis=dict(title="CTL/ATL"),
+            fig.update_layout(height=320, margin=dict(l=0,r=0,t=10,b=0), yaxis=dict(title="CTL/ATL"),
                               yaxis2=dict(title="TSB", overlaying="y", side="right"), legend=dict(orientation="h", y=1.15))
             st.plotly_chart(fig, use_container_width=True, key="pmc_season")
-            tsb_now = pmc["tsb"].iloc[-1]
-            st.caption(f"Forma attuale (TSB): {tsb_now:+.0f} — {ti.tsb_label(tsb_now)}. "
-                       f"Fitness attuale (CTL): {pmc['ctl'].iloc[-1]:.0f}.")
 
     # -- Curva & Profilo --
     with stabs[1]:
@@ -414,11 +472,8 @@ elif mode.startswith("📊"):
             fig.update_yaxes(title="Potenza (W)")
             fig.update_layout(height=380, margin=dict(l=0,r=0,t=10,b=0), showlegend=False)
             st.plotly_chart(fig, use_container_width=True, key="curve_season")
-            if len(season[(season.index>=120)&(season.index<=1200)]) >= 3:
-                cp = ca.critical_power(season, model="3param")
-                ftp = ca.estimate_ftp(season, cp=cp["cp"].value)
-                mapm = ca.maximal_aerobic_power(season)
-                vo2 = ca.estimate_vo2max(athlete, mapm.value)
+            if profile:
+                cp = profile["cp"]; ftp = profile["ftp"]; mapm = profile["map"]; vo2 = profile["vo2"]
                 st.markdown("#### Profilo (dalla curva aggregata)")
                 cA = st.columns(5)
                 metric_card(cA[0], "FTP stagionale", ftp["ftp_recommended"])
@@ -427,6 +482,8 @@ elif mode.startswith("📊"):
                             cp["w_prime"].confidence, cp["w_prime"].method), big=False)
                 metric_card(cA[3], "MAP", mapm)
                 metric_card(cA[4], "VO2max", vo2["vo2max"])
+                cB = st.columns(5)
+                metric_card(cB[0], "FatMax", profile["fatmax"])
                 if not athlete.vo2max_lab:
                     st.caption("⚠️ VO2max è una STIMA da potenza (±10-15%). Il valore vero serve il metabolimetro.")
                 with st.expander("Tutte le stime di FTP (dispersione)"):
