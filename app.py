@@ -141,7 +141,7 @@ if has_power:
 
 tabs = st.tabs(["📈 Curva di potenza", "🎯 Soglie & Zone", "🔬 Analisi sessione",
                 "❤️ Stato di forma", "🔥 Metabolismo & Nutrizione",
-                "🏆 Classificazione", "📅 Settimana & Piano"])
+                "🏆 Classificazione", "📅 Settimana & Piano", "📆 Periodizzazione"])
 
 # ---- 1. CURVA DI POTENZA -------------------------------------------------- #
 with tabs[0]:
@@ -417,6 +417,85 @@ with tabs[6]:
         st.caption("⚠️ " + rec["disclaimer"])
     else:
         st.info("Aggiungi almeno un allenamento alla tabella.")
+
+# ---- 8. PERIODIZZAZIONE (NEW) --------------------------------------------- #
+with tabs[7]:
+    st.markdown("### Periodizzazione verso la gara")
+    st.caption("Pianifica a ritroso dalla data gara: fasi Base→Build→Taper (scarico 3:1), rampa "
+               "di CTL sicura, e proiezione del PMC per arrivare con la freschezza giusta.")
+
+    # CTL/ATL attuali stimati dalla tabella settimanale (scheda precedente)
+    wk_df = st.session_state.get("week_df", demo_week())
+    _sess = [ti.Session(day=(r["data"] if isinstance(r["data"], date) else pd.to_datetime(r["data"]).date()),
+                        tss=float(r["TSS"])) for _, r in wk_df.iterrows() if pd.notna(r.get("TSS"))]
+    if _sess:
+        _pmc0 = ti.training_load(_sess, seed_ctl=55, seed_atl=55)
+        ctl_def, atl_def = int(round(_pmc0["ctl"].iloc[-1])), int(round(_pmc0["atl"].iloc[-1]))
+    else:
+        ctl_def, atl_def = 50, 50
+
+    i1, i2, i3 = st.columns(3)
+    race = i1.date_input("Data gara", value=date.today() + timedelta(weeks=10))
+    event = i2.selectbox("Tipo di evento", list(ti.EVENT_PROFILES.keys()), index=1)
+    ramp = i3.slider("Rampa CTL / settimana (sicura 3-6)", 2, 8, 5)
+    j1, j2 = st.columns(2)
+    cur_ctl = j1.number_input("Fitness attuale (CTL)", 0, 160, ctl_def,
+                              help="Preso dalla scheda Settimana & Piano; modificabile.")
+    cur_atl = j2.number_input("Fatica attuale (ATL)", 0, 160, atl_def)
+
+    plan = ti.periodized_plan(date.today(), race, current_ctl=cur_ctl, current_atl=cur_atl,
+                              event=event, ftp=ftp_val or 250, safe_ramp=ramp,
+                              rider_type=ca.rider_type_full(mmp, mass) if (has_power and len(mmp)) else {})
+
+    if "error" in plan:
+        st.error(plan["error"])
+    else:
+        v = plan["verdict"]
+        (st.success if v.startswith("✅") else st.warning)(v)
+        ps = plan["phase_structure"]
+        s = st.columns(4)
+        s[0].metric("Settimane alla gara", plan["weeks_until"])
+        s[1].metric("Struttura", f"{ps['base_weeks']}B / {ps['build_weeks']}Bu / {ps['taper_weeks']}T")
+        s[2].metric("Picco CTL previsto", plan["peak_ctl"])
+        s[3].metric("TSB al via (previsto)", f"{plan['race_day_tsb']:+.0f}",
+                    f"target {plan['tsb_target'][0]}..{plan['tsb_target'][1]}")
+
+        proj = plan["projection"]
+        proj_x = pd.to_datetime(proj["day"])          # plotly gestisce datetime, non date
+        st.markdown("#### Proiezione Fitness / Fatica / Forma fino alla gara")
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=proj_x, y=proj["ctl"], name="Fitness (CTL)",
+                                 line=dict(color="#0A45FA", width=2.5)))
+        fig.add_trace(go.Scatter(x=proj_x, y=proj["atl"], name="Fatica (ATL)",
+                                 line=dict(color="#B0392E", width=1.5, dash="dot")))
+        fig.add_trace(go.Scatter(x=proj_x, y=proj["tsb"], name="Forma (TSB)",
+                                 line=dict(color="#2e9e5b", width=1.5), yaxis="y2"))
+        lo, hi = plan["tsb_target"]
+        fig.add_hrect(y0=lo, y1=hi, fillcolor="#2e9e5b", opacity=0.10, line_width=0, yref="y2")
+        fig.add_vline(x=pd.Timestamp(race), line_dash="dash", line_color="#0C1623",
+                      annotation_text="GARA")
+        fig.update_layout(height=340, margin=dict(l=0, r=0, t=10, b=0),
+                          yaxis=dict(title="CTL / ATL"),
+                          yaxis2=dict(title="TSB (forma)", overlaying="y", side="right"),
+                          legend=dict(orientation="h", y=1.16))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("La banda verde è la freschezza (TSB) target per l'evento; la linea GARA "
+                   "mostra dove atterri con questo piano.")
+
+        tw = plan["this_week"]
+        st.markdown(f"#### 🎯 Questa settimana — Fase **{tw['phase']}**")
+        st.success(f"**{tw['session']['name']}** — {tw['session']['prescription']}  · _{tw['session']['expected_tss']}_")
+        st.caption(tw["focus"])
+
+        with st.expander("Piano settimana per settimana"):
+            st.dataframe(pd.DataFrame([{"Sett": w["week"], "Fase": w["phase"],
+                        "CTL target": w["target_ctl"], "TSS target": w["weekly_tss"],
+                        "Focus": w["focus"], "Seduta chiave": w["session"]["name"]}
+                        for w in plan["weeks"]]), hide_index=True, use_container_width=True)
+
+        for wn in plan["warnings"]:
+            st.warning("⚠️ " + wn)
+        st.caption("⚠️ " + plan["disclaimer"])
 
 # ---- footer legenda ------------------------------------------------------- #
 st.divider()
