@@ -312,7 +312,8 @@ def recovery_forecast(ctl: float, atl: float, target_tsb: float = 5,
     Giorni di RIPOSO stimati per tornare 'freschi' (TSB >= target_tsb).
     Simula giorni a TSS=0: ATL decade (tc 7gg) piu' in fretta di CTL (tc 42gg),
     quindi il TSB risale. 0 = gia' fresco; max_days = oltre l'orizzonte.
-    Stima su modello (Banister/Coggan), non tiene conto di sonno/HRV/vita reale.
+    Stima su modello (Banister/Coggan) SUL SOLO CARICO. Il recupero autonomico
+    (HRV/HR riposo/sonno) puo' allungarlo: vedi wellness_readiness().
     """
     if ctl - atl >= target_tsb:
         return 0
@@ -323,6 +324,84 @@ def recovery_forecast(ctl: float, atl: float, target_tsb: float = 5,
         if c - a >= target_tsb:
             return d
     return max_days
+
+
+def wellness_readiness(wellness_df) -> dict:
+    """
+    Prontezza autonomica dai dati di benessere di intervals.icu.
+    Confronta HRV/HR-riposo/sonno recenti (media ultimi 3 gg) con una baseline
+    (~ultimi 42 gg) e restituisce stato per metrica + complessivo (verde/ambra/rosso),
+    una penalita' in giorni sul recupero e un flag per la seduta.
+
+    Basato su principi di HRV-guided training (Seiler; HRV4Training; Plews et al.):
+    HRV soppressa, HR a riposo elevata o sonno scarso -> ridurre carico, allungare
+    recupero. STIMA: soglie di popolazione, il tuo range individuale puo' differire.
+    """
+    status = {"hrv": "n/d", "rhr": "n/d", "sleep": "n/d", "overall": "n/d",
+              "recovery_penalty_days": 0, "flag": "", "have_data": False,
+              "confidence": Confidence.ESTIMATED}
+    if wellness_df is None or len(wellness_df) == 0 or "hrv" not in wellness_df:
+        return status
+    df = wellness_df.dropna(subset=["hrv"]).sort_values("date")
+    if len(df) < 7:
+        return status
+    status["have_data"] = True
+
+    # HRV: z-score dei recenti rispetto alla baseline (che ESCLUDE i giorni recenti)
+    recent_hrv = df["hrv"].tail(3).mean()
+    base = df["hrv"].iloc[:-3].tail(42)
+    mu, sd = base.mean(), (base.std() or 1e-6)
+    z = (recent_hrv - mu) / sd
+    if z < -1.0:
+        status["hrv"], hrv_pen = "soppressa", 2
+    elif z < -0.3:
+        status["hrv"], hrv_pen = "sotto la norma", 1
+    else:
+        status["hrv"], hrv_pen = "nella norma", 0
+
+    # HR a riposo: elevazione rispetto alla baseline (esclusi i recenti)
+    rhr_pen = 0
+    if "resting_hr" in df and df["resting_hr"].notna().sum() >= 7:
+        rr = df.dropna(subset=["resting_hr"])
+        recent_rhr = rr["resting_hr"].tail(3).mean()
+        base_rhr = rr["resting_hr"].iloc[:-3].tail(42).mean()
+        if recent_rhr > base_rhr + 5:
+            status["rhr"], rhr_pen = "elevata", 1
+        elif recent_rhr > base_rhr + 2:
+            status["rhr"], rhr_pen = "leggermente elevata", 1
+        else:
+            status["rhr"] = "normale"
+
+    # Sonno
+    sleep_pen = 0
+    if "sleep_hours" in df and df["sleep_hours"].notna().sum() >= 3:
+        sh = df.dropna(subset=["sleep_hours"])["sleep_hours"].tail(3).mean()
+        if sh < 6:
+            status["sleep"], sleep_pen = "scarso", 1
+        elif sh < 7:
+            status["sleep"], sleep_pen = "sotto la norma", 0
+        else:
+            status["sleep"] = "buono"
+
+    pen = hrv_pen + rhr_pen + sleep_pen
+    status["recovery_penalty_days"] = pen
+    if pen >= 3:
+        status["overall"] = "rosso"
+        status["flag"] = "Segnali di scarso recupero: oggi meglio riposo o solo aerobico leggero."
+    elif pen >= 1:
+        status["overall"] = "ambra"
+        status["flag"] = "Recupero incompleto: modera l'intensità, evita sedute molto dure."
+    else:
+        status["overall"] = "verde"
+        status["flag"] = "Buon recupero: via libera all'allenamento."
+    return status
+
+
+def adjusted_recovery_days(base_days: int, readiness: dict) -> int:
+    """Recupero in giorni = stima da carico (TSB) + penalita' da wellness (HRV/RHR/sonno)."""
+    if not readiness or not readiness.get("have_data"):
+        return base_days
+    return base_days + int(readiness.get("recovery_penalty_days", 0))
 
 
 def _session_template(kind: str, ftp: float) -> dict:
@@ -348,26 +427,37 @@ def _session_template(kind: str, ftp: float) -> dict:
 
 
 def recommend_next_workout(pmc: pd.DataFrame, weekly: dict, rider_type: dict,
-                           ftp: float, target: str = "limiter") -> dict:
+                           ftp: float, target: str = "limiter",
+                           readiness: dict = None) -> dict:
     """
     Propone la sessione successiva combinando FORMA (TSB), BILANCIO settimanale
-    (polarizzazione, intensita' recente) e TIPO di corridore.
+    (polarizzazione, intensita' recente), TIPO di corridore e — se disponibile —
+    la PRONTEZZA autonomica da wellness (HRV/HR-riposo/sonno).
 
-    target: "limiter" (default, allena il punto debole -> piu' guadagno) oppure
-            "strength" (asseconda la specializzazione).
+    target: "limiter" (allena il punto debole) o "strength" (asseconda la forza).
+    readiness: output di wellness_readiness() (opzionale). 'rosso' forza il recupero
+               a prescindere dal TSB; 'ambra' declassa le sedute molto intense.
 
-    Euristica su principi consolidati. NON sostituisce una periodizzazione verso
-    un obiettivo/gara: e' una bussola per la prossima uscita.
+    Euristica su principi consolidati (polarizzazione, recupero da TSB, HRV-guided
+    training). NON sostituisce una periodizzazione verso una gara.
     """
     tsb = float(pmc["tsb"].iloc[-1]) if len(pmc) else 0.0
     dist = weekly.get("distribution", "")
     high = weekly.get("frac_high", 0.0)
     monotony = weekly.get("monotony", 0.0)
+    r_overall = readiness.get("overall") if readiness and readiness.get("have_data") else None
 
     reasons, alternatives = [], []
 
+    # 0) WELLNESS ROSSO: il recupero autonomico ha la precedenza sul TSB
+    if r_overall == "rosso":
+        primary = _session_template("recupero", ftp)
+        reasons.append(readiness["flag"] +
+                       f" (HRV {readiness['hrv']}, HR riposo {readiness['rhr']}, sonno {readiness['sleep']}).")
+        alternatives.append(_session_template("fondo", ftp))
+
     # 1) FATICA profonda o monotonia alta -> recupero
-    if tsb < -25 or monotony > 2.5:
+    elif tsb < -25 or monotony > 2.5:
         primary = _session_template("recupero", ftp)
         reasons.append(f"Forma bassa (TSB {tsb:+.0f})" +
                        (" e monotonia elevata" if monotony > 2.5 else "") +
@@ -383,7 +473,6 @@ def recommend_next_workout(pmc: pd.DataFrame, weekly: dict, rider_type: dict,
 
     # 3) Fresco e non troppa intensita' -> sessione di qualita' mirata
     elif tsb > -10:
-        # scegli la qualita' in base al target e al tipo di corridore
         rel = rider_type.get("relative_strengths", {})
         if rel:
             weakest = min(rel, key=rel.get)
@@ -410,15 +499,22 @@ def recommend_next_workout(pmc: pd.DataFrame, weekly: dict, rider_type: dict,
                        "soglia bassa senza aggiungere troppa fatica.")
         alternatives.append(_session_template("fondo", ftp))
 
+    # WELLNESS AMBRA: declassa le sedute molto intense (VO2/anaerobico) a sweet-spot
+    if r_overall == "ambra" and primary["kind"] in ("vo2max", "anaerobico"):
+        alternatives.insert(0, primary)
+        primary = _session_template("sweetspot", ftp)
+        reasons.append(readiness["flag"] + " Ho abbassato l'intensità della seduta prevista.")
+
     return {
         "recommended": primary,
         "alternatives": alternatives,
         "rationale": " ".join(reasons),
         "based_on": {"tsb": round(tsb, 1), "weekly_distribution": dist,
-                     "rider_type": rider_type.get("primary", "")},
+                     "rider_type": rider_type.get("primary", ""),
+                     "wellness": r_overall or "n/d"},
         "confidence": Confidence.ESTIMATED,
-        "disclaimer": ("Euristica su principi allenanti (polarizzazione, recupero da TSB). "
-                       "Non e' una periodizzazione verso una gara specifica."),
+        "disclaimer": ("Euristica su principi allenanti (polarizzazione, recupero da TSB, "
+                       "HRV-guided). Non e' una periodizzazione verso una gara specifica."),
     }
 
 
