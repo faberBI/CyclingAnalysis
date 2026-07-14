@@ -309,6 +309,18 @@ def test_classify_amateur_bands():
     assert ca.classify_amateur(2.8)["position"] < ca.classify_amateur(4.1)["position"]
 
 
+def test_polarization_from_hist():
+    edges = np.arange(0, 1610, 10)
+    counts = np.zeros(len(edges) - 1)
+    def add(w, s): counts[np.searchsorted(edges, w) - 1] += s
+    add(150, 3600); add(260, 600); add(340, 300)     # low, mid, high con FTP=300
+    pol = ti.polarization_from_hist(edges, counts, ftp=300)
+    assert pol["pct_low"] + pol["pct_mid"] + pol["pct_high"] == pytest.approx(100, abs=1)
+    assert pol["pct_low"] > 70                         # dominante low
+    assert pol["low_h"] == pytest.approx(1.0, abs=0.01)  # 3600s = 1h
+    assert "Polarizzata" in pol["label"]
+
+
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     import sys
