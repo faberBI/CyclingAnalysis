@@ -188,6 +188,27 @@ class Session:
     frac_high: float = 0.0    # Z5+
 
 
+def pmc_from_activities(activities: list[dict]) -> pd.DataFrame:
+    """
+    Costruisce il PMC (CTL/ATL/TSB) su TUTTO lo storico a partire dall'elenco
+    attivita' di intervals.icu (ognuna con 'date' e 'load'=TSS). Seed a 0: con lo
+    storico completo il CTL si costruisce correttamente dall'inizio.
+    """
+    sessions = []
+    for a in activities:
+        d = a.get("date")
+        if not d:
+            continue
+        try:
+            day = pd.to_datetime(d).date()
+        except Exception:
+            continue
+        sessions.append(Session(day=day, tss=float(a.get("load") or 0)))
+    if not sessions:
+        return pd.DataFrame()
+    return training_load(sessions)
+
+
 def training_load(sessions: list[Session],
                   ctl_tc: int = 42, atl_tc: int = 7,
                   seed_ctl: float = 0.0, seed_atl: float = 0.0) -> pd.DataFrame:
