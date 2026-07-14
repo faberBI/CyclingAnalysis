@@ -322,6 +322,28 @@ if mode.startswith("📄"):
                 fm = ca.fatmax(map_m.value, athlete)
                 st.markdown(f"**FatMax:** {fm.value:.0f} W {badge(fm.confidence)} · _{fm.note}_",
                             unsafe_allow_html=True)
+
+                # Curva di ottimizzazione del consumo di grassi
+                foc = ca.fat_oxidation_curve(map_m.value, athlete)
+                fc = foc["curve"]
+                st.markdown(f"#### 🔥 Ottimizzazione consumo grassi {badge(foc['confidence'])}",
+                            unsafe_allow_html=True)
+                figf = go.Figure()
+                figf.add_trace(go.Scatter(x=fc["watt"], y=fc["fat_g_min"], name="Grassi (g/min)",
+                                          line=dict(color="#E08A00", width=3), fill="tozeroy",
+                                          fillcolor="rgba(224,138,0,0.12)"))
+                figf.add_trace(go.Scatter(x=fc["watt"], y=fc["cho_g_min"], name="Carboidrati (g/min)",
+                                          line=dict(color="#0A45FA", width=2, dash="dot")))
+                figf.add_vline(x=foc["fatmax_watt"], line_dash="dash", line_color="#B0392E",
+                               annotation_text=f"max grassi ~{foc['fatmax_watt']:.0f}W")
+                figf.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0),
+                                   xaxis_title="Potenza (W)", yaxis_title="Ossidazione (g/min)",
+                                   legend=dict(orientation="h", y=1.15))
+                st.plotly_chart(figf, use_container_width=True, key="fatox")
+                st.info(f"Bruci il massimo di grassi intorno a **{foc['fatmax_watt']:.0f} W** "
+                        f"(~{foc['fatmax_pct']:.0f}% della MAP, ~{foc['fatmax_fat_g_min']:.2f} g/min): "
+                        "è l'intensità da tenere per il fondo brucia-grassi e le uscite lunghe. "
+                        f"_{foc['note']}_")
             st.divider()
             st.markdown("### Fabbisogno calorico")
             act = st.select_slider("Attività (vita non sportiva)", options=[1.2,1.375,1.55,1.725],
@@ -579,6 +601,64 @@ elif mode.startswith("📊"):
             st.warning("⚠️ Livelli amatoriali = Power Profile di Coggan (robusti). Livelli pro / top-20 GT / "
                        "top-10 Tour = STIME da letteratura e analisi salite (SRM, VAM), NON da laboratorio: "
                        "ordini di grandezza.")
+
+            # --- Confronto divertente con i pro + Pogačar ---
+            st.divider()
+            st.markdown("#### 🏆 Tu vs i professionisti (e Pogačar 👑)")
+            pcmp = ca.pro_comparison(season, mass)
+            if pcmp["rows"]:
+                dur_opts = {r["durata"]: r for r in pcmp["rows"]}
+                sel = st.selectbox("Durata da confrontare", list(dur_opts.keys()),
+                                   index=len(dur_opts) - 1)
+                r = dur_opts[sel]
+                cats = [("🚴 Tu", r["tu"], "#0A45FA"), ("🟢 Continental", r["continental"], "#2e9e5b"),
+                        ("🔵 Professional", r["professional"], "#0088CC"),
+                        ("🟣 World Tour", r["world_tour"], "#7A3FF2"),
+                        ("👑 Pogačar", r["pogacar"], "#E0A400")]
+                figp = go.Figure(go.Bar(x=[c[1] for c in cats], y=[c[0] for c in cats],
+                    orientation="h", marker_color=[c[2] for c in cats],
+                    text=[f"{c[1]:.1f}" for c in cats], textposition="outside"))
+                figp.update_layout(height=260, margin=dict(l=0, r=0, t=10, b=0),
+                                   xaxis_title=f"W/kg — {sel}", yaxis=dict(autorange="reversed"))
+                st.plotly_chart(figp, use_container_width=True, key="procomp")
+                pct = r["pct_pogacar"]
+                if pct is not None:
+                    emoji = ("🌱" if pct < 50 else "🚴" if pct < 70 else "💪" if pct < 85
+                             else "🔥" if pct <= 100 else "🤯👑")
+                    msg = ("continua a spingere!" if pct < 50 else "buon amatore" if pct < 70
+                           else "sei forte!" if pct < 85 else "quasi da pro!" if pct <= 100
+                           else "hai battuto Pogi?!")
+                    st.success(f"{emoji} Sul **{sel}** sei al **{pct}% di Pogačar** — {msg}")
+                st.caption("⚠️ " + pcmp["note"])
+
+            # --- Dove sei tra gli amatori: low / middle / top ---
+            st.divider()
+            st.markdown("#### Dove sei tra gli amatori")
+            if profile:
+                ftp_wkg = profile["ftp"]["ftp_recommended"].value / mass
+                am = ca.classify_amateur(ftp_wkg)
+                emj = {"Amatore base (low)": "🌱", "Amatore intermedio (mid)": "🚴",
+                       "Amatore avanzato (top)": "💪", "Agonista / Elite amat.": "🏆"}.get(am["tier"], "🚴")
+                st.markdown(f"### {emj} {am['tier']} · {ftp_wkg:.2f} W/kg FTP {badge(am['confidence'])}",
+                            unsafe_allow_html=True)
+                figa = go.Figure()
+                band_colors = ["#e8f0eb", "#bfe0cc", "#7fc79f", "#3fae6e"]
+                for (name, lo, hi), col in zip(am["bands"], band_colors):
+                    figa.add_vrect(x0=max(lo, 2.0), x1=min(hi, 5.0), fillcolor=col, opacity=0.75,
+                                   line_width=0, annotation_text=name.split(" (")[0],
+                                   annotation_position="top left", annotation=dict(font_size=9))
+                figa.add_vline(x=min(ftp_wkg, 5.0), line_color="#B0392E", line_width=3,
+                               annotation_text=f"tu {ftp_wkg:.2f}")
+                figa.add_trace(go.Scatter(x=[2.0, 5.0], y=[0, 0], mode="lines",
+                                          line=dict(width=0), showlegend=False))
+                figa.update_layout(height=150, margin=dict(l=0, r=0, t=28, b=0),
+                                   xaxis_title="FTP W/kg", xaxis_range=[2.0, 5.0],
+                                   yaxis=dict(visible=False, range=[-1, 1]))
+                st.plotly_chart(figa, use_container_width=True, key="amateur")
+                st.caption("Fasce (uomini, indicative): base(low) <3.1 · intermedio(mid) 3.1-3.8 · "
+                           "avanzato(top) 3.8-4.5 · agonista >4.5 W/kg.")
+            else:
+                st.info("Serve la FTP stagionale (curva aggregata) per la classifica amatori.")
         else:
             st.info("Nessuna curva disponibile.")
 
