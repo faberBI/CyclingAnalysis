@@ -573,3 +573,87 @@ def periodized_plan(current_date: date, race_date: date, current_ctl: float,
                        "individualizzato né tiene conto della tua storia/risposta. Modello a singolo "
                        "picco; i target di TSB sono regole del pollice."),
     }
+
+
+# --------------------------------------------------------------------------- #
+#  8. AUTO-DETECTION DEGLI INTERVALLI                                         #
+# --------------------------------------------------------------------------- #
+def detect_intervals(power, ftp: float, min_seconds: int = 20,
+                     threshold_pct: float = 1.02, gap_seconds: int = 15) -> list[dict]:
+    """
+    Rileva automaticamente gli sforzi 'hard' dell'uscita: tratti con potenza sopra
+    threshold_pct*FTP per almeno min_seconds, unendo micro-cali < gap_seconds.
+    Utile per capire la STRUTTURA dell'allenamento senza inserirla a mano.
+    """
+    import numpy as _np
+    p = _np.nan_to_num(_np.asarray(power, dtype=float), nan=0.0)
+    above = (p >= threshold_pct * ftp).astype(int)
+    edges = _np.diff(_np.concatenate([[0], above, [0]]))
+    starts = list(_np.where(edges == 1)[0])
+    ends = list(_np.where(edges == -1)[0])            # esclusivo
+    merged = []
+    for s, e in zip(starts, ends):
+        if merged and s - merged[-1][1] < gap_seconds:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    out = []
+    for s, e in merged:
+        if e - s >= min_seconds:
+            seg = p[s:e]
+            avg = float(seg.mean())
+            out.append({"start_s": int(s), "duration_s": int(e - s),
+                        "avg_power": round(avg), "pct_ftp": round(avg / ftp * 100),
+                        "peak_power": round(float(seg.max()))})
+    return out
+
+
+# --------------------------------------------------------------------------- #
+#  9. ANALISI STAGIONE + TREND NEL TEMPO (da intervals.icu)                   #
+# --------------------------------------------------------------------------- #
+def analyze_season_from_intervals(athlete, athlete_id: str, api_key: str,
+                                  activities: list[dict], progress_cb=None,
+                                  max_activities: int = 60) -> dict:
+    """
+    Un'unica passata sugli streams delle attivita' (una chiamata /streams ciascuna):
+    costruisce la curva di potenza stagionale E la serie temporale di eFTP, VO2max
+    stimata e decoupling per uscita (il 'film', non la foto). Ritorna
+    {season_curve, trends(DataFrame date/eftp/vo2max/decoupling/tss), used}.
+    """
+    import time as _time
+    import cycling_analytics as ca
+    acts = [a for a in activities if a.get("has_power")][:max_activities]
+    curves, rows, used = [], [], 0
+    n = len(acts) or 1
+    for i, a in enumerate(acts):
+        try:
+            df1 = ca.to_1hz(ca.load_intervals_icu(a["id"], api_key))
+            if "power" in df1.columns and float(df1["power"].sum()) > 0:
+                power = df1["power"].values
+                mmp_a = ca.mean_maximal_power(power)
+                curves.append(mmp_a)
+                eftp = (0.95 * mmp_a[1200] if 1200 in mmp_a.index
+                        else 0.90 * mmp_a[480] if 480 in mmp_a.index else np.nan)
+                vo2 = (ca.estimate_vo2max(athlete, mmp_a[300])["vo2max"].value
+                       if 300 in mmp_a.index else np.nan)
+                dec = np.nan
+                if "hr" in df1.columns and df1["hr"].notna().any():
+                    dec = aerobic_decoupling(power, df1["hr"].values).value
+                rows.append({"date": a.get("date"),
+                             "eftp": round(float(eftp)) if eftp == eftp else np.nan,
+                             "vo2max": round(float(vo2), 1) if vo2 == vo2 else np.nan,
+                             "decoupling": round(float(dec), 1) if dec == dec else np.nan,
+                             "tss": a.get("load") or np.nan})
+                used += 1
+        except Exception:
+            pass
+        if progress_cb:
+            progress_cb((i + 1) / n)
+        _time.sleep(0.12)
+    season = (pd.concat(curves, axis=1).max(axis=1).rename("mmp_watt")
+              if curves else pd.Series(dtype=float))
+    trends = pd.DataFrame(rows)
+    if len(trends):
+        trends["date"] = pd.to_datetime(trends["date"], errors="coerce")
+        trends = trends.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    return {"season_curve": season, "trends": trends, "used": used}
