@@ -372,3 +372,183 @@ def recommend_next_workout(pmc: pd.DataFrame, weekly: dict, rider_type: dict,
         "disclaimer": ("Euristica su principi allenanti (polarizzazione, recupero da TSB). "
                        "Non e' una periodizzazione verso una gara specifica."),
     }
+
+
+# --------------------------------------------------------------------------- #
+#  7. PERIODIZZAZIONE VERSO UNA GARA                                          #
+# --------------------------------------------------------------------------- #
+# Pianifica a ritroso dalla data gara: fasi Base->Build->Taper (scarico 3:1),
+# rampa di CTL sicura, e PROIEZIONE in avanti del PMC per verificare di arrivare
+# con la freschezza (TSB) giusta.
+#
+# ONESTA': e' un modello su principi consolidati (Friel/Bompa fasi; Coggan/TP
+# target CTL/TSB; Seiler polarizzazione). NON e' coaching individualizzato: non
+# conosce la tua storia, il tuo tasso di risposta, lo stress di vita, i dettagli
+# dell'evento. I target di TSB a fine gara sono regole del pollice (alcuni atleti
+# picccano a +5, altri a +25). Raggiungere i numeri di carico non garantisce la
+# forma: devi comunque fare bene le sedute. Modello a singolo picco.
+
+# tsb = banda di freschezza a fine taper; taper_weeks = settimane di scarico;
+# focus = enfasi delle qualita' nel Build.  (regole del pollice, non scienza esatta)
+EVENT_PROFILES = {
+    "Granfondo / Ciclistica":   {"tsb": (5, 15),  "taper_weeks": 2,
+                                 "focus": "endurance lunga + soglia + durabilità"},
+    "Gara in linea (1 giorno)": {"tsb": (10, 20), "taper_weeks": 2,
+                                 "focus": "soglia + VO2max + strappi"},
+    "Cronometro (TT)":          {"tsb": (15, 25), "taper_weeks": 2,
+                                 "focus": "soglia/FTP sostenuta"},
+    "Criterium":                {"tsb": (5, 15),  "taper_weeks": 1,
+                                 "focus": "anaerobico + VO2max + ripetibilità"},
+    "Corsa a tappe":            {"tsb": (5, 12),  "taper_weeks": 2,
+                                 "focus": "volume + soglia ripetuta + durabilità"},
+}
+
+# frazione del TSS settimanale per giorno (microciclo tipo)
+_MICROCYCLE = [0.0, 0.18, 0.14, 0.20, 0.0, 0.30, 0.18]   # Lun..Dom
+_CTL_TC = 42
+_F7 = 1 - (1 - 1 / _CTL_TC) ** 7                          # ~0.1552: quota di 'inseguimento' in 7 gg
+
+def _weekly_tss_for_ramp(ctl_start: float, ramp: float) -> float:
+    """TSS settimanale per far salire il CTL di `ramp` punti in 7 giorni."""
+    d = ctl_start + ramp / _F7        # TSS medio giornaliero necessario
+    return max(0.0, 7 * d)
+
+def _phase_focus(phase: str, event_focus: str) -> str:
+    return {
+        "Base":  "Volume aerobico (Z2), polarizzato 80/20, con lungo settimanale",
+        "Build": f"Intensità mirata: {event_focus}",
+        "Taper": "Riduci il volume, mantieni stimoli brevi (aperture/richiami), arriva fresco",
+        "Scarico": "Settimana di scarico: ~50% del carico per assorbire l'adattamento",
+    }[phase]
+
+def _phase_session(phase: str, event: str, ftp: float, rider_type: dict) -> dict:
+    if phase == "Base":
+        return _session_template("lungo", ftp)
+    if phase == "Scarico":
+        return _session_template("fondo", ftp)
+    if phase == "Taper":
+        return _session_template("vo2max", ftp)   # brevi richiami, volume ridotto
+    # Build: seduta secondo l'evento (o il limitante)
+    kind = {"Granfondo / Ciclistica": "soglia", "Gara in linea (1 giorno)": "vo2max",
+            "Cronometro (TT)": "soglia", "Criterium": "anaerobico",
+            "Corsa a tappe": "soglia"}.get(event, "soglia")
+    return _session_template(kind, ftp)
+
+
+def periodized_plan(current_date: date, race_date: date, current_ctl: float,
+                    current_atl: Optional[float] = None,
+                    event: str = "Gara in linea (1 giorno)",
+                    ftp: float = 250, safe_ramp: float = 5.0,
+                    rider_type: Optional[dict] = None) -> dict:
+    """
+    Piano periodizzato dalla data odierna alla gara + proiezione del PMC.
+    safe_ramp = incremento di CTL/settimana desiderato (sicuro ~3-6; >8 rischioso).
+    """
+    rider_type = rider_type or {}
+    if current_atl is None:
+        current_atl = current_ctl
+    prof = EVENT_PROFILES.get(event, EVENT_PROFILES["Gara in linea (1 giorno)"])
+    tsb_lo, tsb_hi = prof["tsb"]
+
+    days_to_race = (race_date - current_date).days
+    warnings = []
+    if days_to_race <= 0:
+        return {"error": "La data gara deve essere futura."}
+    W = max(1, (days_to_race + 6) // 7)          # settimane (arrotonda per eccesso)
+
+    # --- struttura fasi ---
+    if W <= 2:
+        # A <2 settimane non si guadagna fitness utile: solo affinamento/freschezza.
+        taper = W
+        loading = 0
+        base_count = 0
+        warnings.append("Meno di ~2 settimane alla gara: non c'è tempo per costruire fitness "
+                        "(gli adattamenti richiedono settimane). Piano di solo affinamento e freschezza.")
+    else:
+        taper = prof["taper_weeks"]
+        taper = min(taper, W - 1)
+        loading = W - taper
+        base_count = max(0, round(loading * 0.55)) if loading > 2 else 0
+
+    # --- piano settimanale (TSS + CTL intesa) ---
+    weeks = []
+    ctl_int = current_ctl
+    last_build_weekly = 7 * current_ctl
+    li = 0
+    for i in range(W):
+        in_taper = i >= (W - taper)
+        if in_taper:
+            phase = "Taper"
+            ti_ = i - (W - taper)                 # 0-based nel taper
+            frac = ([0.6, 0.4] if taper == 2 else [0.5])[min(ti_, taper - 1)]
+            wk = frac * last_build_weekly
+            ctl_int += -3
+        else:
+            recovery = (li + 1) % 4 == 0 and li < loading - 1     # scarico 3:1
+            if recovery:
+                phase = "Scarico"
+                wk = 0.55 * last_build_weekly
+                ctl_int += -1.5
+            else:
+                phase = "Base" if li < base_count else "Build"
+                ramp = safe_ramp * (0.85 if phase == "Base" else 1.0)
+                wk = _weekly_tss_for_ramp(ctl_int, ramp)
+                ctl_int += ramp
+                last_build_weekly = wk
+            li += 1
+        if wk > 800:
+            warnings.append(f"Settimana {i+1}: TSS target {wk:.0f} molto alto per un amatore — "
+                            "valuta un safe_ramp più basso.")
+        weeks.append({"week": i + 1,
+                      "start": current_date + timedelta(days=7 * i),
+                      "phase": phase,
+                      "focus": _phase_focus(phase, prof["focus"]),
+                      "target_ctl": round(ctl_int),
+                      "weekly_tss": round(wk),
+                      "session": _phase_session(phase, event, ftp, rider_type)})
+
+    # --- proiezione PMC in avanti (giorno per giorno) ---
+    sessions = []
+    for wk in weeks:
+        for dofs, frac in enumerate(_MICROCYCLE):
+            day = wk["start"] + timedelta(days=dofs)
+            if day > race_date:
+                break
+            sessions.append(Session(day=day, tss=wk["weekly_tss"] * frac))
+    proj = training_load(sessions, seed_ctl=current_ctl, seed_atl=current_atl)
+
+    # TSB previsto il giorno gara
+    race_row = proj[proj["day"] == race_date]
+    race_tsb = float(race_row["tsb"].iloc[0]) if len(race_row) else float(proj["tsb"].iloc[-1])
+    peak_ctl = float(proj["ctl"].max())
+
+    if race_tsb < tsb_lo:
+        verdict = f"⚠️ Arrivi troppo affaticato (TSB previsto {race_tsb:+.0f}, target {tsb_lo}..{tsb_hi}). Allunga o accentua il taper."
+    elif race_tsb > tsb_hi:
+        verdict = f"⚠️ Arrivi troppo scarico (TSB previsto {race_tsb:+.0f}, target {tsb_lo}..{tsb_hi}). Accorcia il taper o tieni più carico."
+    else:
+        verdict = f"✅ Arrivi in forma: TSB previsto {race_tsb:+.0f} (target {tsb_lo}..{tsb_hi})."
+
+    # settimana corrente (la prima del piano)
+    this_week = weeks[0]
+
+    return {
+        "weeks_until": W,
+        "days_to_race": days_to_race,
+        "phase_structure": {"base_weeks": base_count,
+                            "build_weeks": loading - base_count,
+                            "taper_weeks": taper},
+        "weeks": weeks,
+        "projection": proj,                 # DataFrame day/ctl/atl/tsb
+        "race_day_tsb": round(race_tsb, 1),
+        "tsb_target": (tsb_lo, tsb_hi),
+        "peak_ctl": round(peak_ctl),
+        "verdict": verdict,
+        "this_week": this_week,
+        "warnings": warnings,
+        "confidence": Confidence.ESTIMATED,
+        "disclaimer": ("Modello di pianificazione su principi consolidati (fasi Friel/Bompa, "
+                       "target CTL/TSB Coggan/TrainingPeaks, polarizzazione Seiler). Non è coaching "
+                       "individualizzato né tiene conto della tua storia/risposta. Modello a singolo "
+                       "picco; i target di TSB sono regole del pollice."),
+    }
