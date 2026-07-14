@@ -954,3 +954,37 @@ def durability(power, durations=(5, 15, 60, 300, 1200), kj_threshold: float = 20
             out["per_duration"][dsec] = {"fresh": round(f), "fatigued": round(g),
                                          "drop_pct": round((f - g) / f * 100, 1)}
     return out
+
+
+# --------------------------------------------------------------------------- #
+# 14. WELLNESS (HRV / HR a riposo / sonno) da intervals.icu                    #
+# --------------------------------------------------------------------------- #
+def load_intervals_wellness(athlete_id: str, api_key: str, days_back: int = 60) -> pd.DataFrame:
+    """
+    Dati di benessere giornalieri da intervals.icu: HRV (rMSSD), HR a riposo, sonno.
+    Endpoint: GET /api/v1/athlete/{id}/wellness?oldest=...&newest=...
+    Ritorna un DataFrame con colonne date, hrv, resting_hr, sleep_hours (assenti se il
+    campo non e' presente). Stesso auth + User-Agent browser (Cloudflare) degli altri
+    loader. NON testato contro l'API live da qui.
+    """
+    import requests
+    from datetime import date, timedelta
+    url = f"https://intervals.icu/api/v1/athlete/{athlete_id}/wellness"
+    headers = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")}
+    params = {"oldest": (date.today() - timedelta(days=days_back)).isoformat(),
+              "newest": date.today().isoformat()}
+    r = requests.get(url, auth=("API_KEY", api_key), headers=headers, params=params, timeout=30)
+    r.raise_for_status()
+    rows = []
+    for w in r.json():
+        ss = w.get("sleepSecs")
+        rows.append({"date": w.get("id"),
+                     "hrv": w.get("hrv"),
+                     "resting_hr": w.get("restingHR"),
+                     "sleep_hours": (ss / 3600.0) if ss else np.nan})
+    df = pd.DataFrame(rows)
+    if len(df):
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    return df
