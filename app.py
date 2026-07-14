@@ -510,9 +510,53 @@ elif mode.startswith("📊"):
                               yaxis2=dict(title="TSB", overlaying="y", side="right"), legend=dict(orientation="h", y=1.15))
             st.plotly_chart(fig, use_container_width=True, key="pmc_season")
 
-    # -- Curva & Profilo --
-    with stabs[1]:
-        if res and len(season):
+        # Distribuzione di intensità (polarizzazione, Seiler 80/20)
+        if res and profile and res.get("power_hist"):
+            ftp_s = profile["ftp"]["ftp_recommended"].value
+            pol = ti.polarization_from_hist(res["power_hist"]["edges"],
+                                            res["power_hist"]["counts"], ftp_s)
+            st.markdown(f"#### Distribuzione di intensità — polarizzazione {badge(pol['confidence'])}",
+                        unsafe_allow_html=True)
+            figpol = go.Figure()
+            figpol.add_trace(go.Bar(x=[pol["pct_low"]], y=["stagione"], orientation="h",
+                name="Low Z1-2", marker_color="#2e9e5b", text=f"{pol['pct_low']}%", textposition="inside"))
+            figpol.add_trace(go.Bar(x=[pol["pct_mid"]], y=["stagione"], orientation="h",
+                name="Mid soglia", marker_color="#E08A00", text=f"{pol['pct_mid']}%", textposition="inside"))
+            figpol.add_trace(go.Bar(x=[pol["pct_high"]], y=["stagione"], orientation="h",
+                name="High Z5+", marker_color="#B0392E", text=f"{pol['pct_high']}%", textposition="inside"))
+            figpol.update_layout(barmode="stack", height=130, margin=dict(l=0, r=0, t=10, b=0),
+                                 xaxis_title="% del tempo pedalato", yaxis=dict(visible=False),
+                                 legend=dict(orientation="h", y=1.5))
+            st.plotly_chart(figpol, use_container_width=True, key="polarization")
+            st.caption(f"**{pol['label']}** · Low {pol['low_h']:.0f}h / Mid {pol['mid_h']:.0f}h / "
+                       f"High {pol['high_h']:.0f}h. Modello 3-zone (Seiler): <80% FTP / 80-105% / >105%. "
+                       "L'ideale polarizzato è ~80% low e poca 'zona grigia'.")
+
+        # Heatmap del carico (calendario stile GitHub, TSS/giorno)
+        if len(pmc):
+            st.markdown("#### Costanza del carico — TSS per giorno")
+            cal = pmc[["day", "tss"]].copy()
+            cal["day"] = pd.to_datetime(cal["day"])
+            start_monday = cal["day"].min() - pd.Timedelta(days=int(cal["day"].min().dayofweek))
+            cal["wk"] = ((cal["day"] - start_monday).dt.days // 7).astype(int)
+            cal["wd"] = cal["day"].dt.dayofweek
+            nwk = int(cal["wk"].max()) + 1
+            z = np.full((7, nwk), np.nan)
+            hover = np.empty((7, nwk), dtype=object)
+            for _, rr in cal.iterrows():
+                z[int(rr["wd"]), int(rr["wk"])] = rr["tss"]
+                hover[int(rr["wd"]), int(rr["wk"])] = f"{rr['day'].strftime('%d %b %Y')}: {rr['tss']:.0f} TSS"
+            figcal = go.Figure(go.Heatmap(
+                z=z, customdata=hover, hovertemplate="%{customdata}<extra></extra>",
+                colorscale=[[0, "#ebedf0"], [0.001, "#c6e48b"], [0.35, "#7bc96f"],
+                            [0.7, "#239a3b"], [1, "#196127"]],
+                xgap=2, ygap=2, showscale=True, zmin=0,
+                y=["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]))
+            figcal.update_layout(height=210, margin=dict(l=0, r=0, t=10, b=0),
+                                 yaxis=dict(autorange="reversed"), xaxis=dict(visible=False))
+            st.plotly_chart(figcal, use_container_width=True, key="heatmap")
+            st.caption("Ogni cella è un giorno (verde più scuro = più carico). Le celle chiare sono "
+                       "riposo/stop: colpo d'occhio su costanza e buchi.")
             st.markdown(f"#### Curva di potenza aggregata su {res['used']} attività {badge(Confidence.MEASURED)}",
                         unsafe_allow_html=True)
             fig = go.Figure()
@@ -667,22 +711,27 @@ elif mode.startswith("📊"):
         trends = res["trends"] if res else None
         if trends is not None and len(trends):
             st.markdown("#### Trend nel tempo (il film, non la foto)")
-            st.caption("Stai migliorando? eFTP e VO2max stimate per uscita, e decoupling (più basso = più efficiente).")
-            specs = [("eftp","eFTP stimata","#0A45FA","W"),
-                     ("vo2max","VO2max stimata","#2e9e5b","mL/kg/min"),
-                     ("decoupling","Decoupling Pw:Hr","#E08A00","%")]
-            tc = st.columns(3)
-            for col, (field, title, color, unit) in zip(tc, specs):
-                sub = trends.dropna(subset=[field])
-                with col:
-                    if len(sub) >= 2:
-                        fig = go.Figure(go.Scatter(x=sub["date"], y=sub[field], mode="markers+lines",
-                            line=dict(color=color, width=1.5), marker=dict(size=5)))
-                        fig.update_layout(height=230, margin=dict(l=0,r=0,t=32,b=0),
-                            title=dict(text=f"{title} ({unit})", font=dict(size=13)), showlegend=False)
-                        st.plotly_chart(fig, use_container_width=True, key=f"trend_{field}")
-                    else:
-                        st.caption(f"{title}: dati insufficienti.")
+            st.caption("Stai migliorando? eFTP e VO2max per uscita, Efficiency Factor (potenza/HR: "
+                       "sale se la fitness aerobica migliora) e decoupling (più basso = più efficiente).")
+            specs = [("eftp", "eFTP stimata", "#0A45FA", "W"),
+                     ("vo2max", "VO2max stimata", "#2e9e5b", "mL/kg/min"),
+                     ("ef", "Efficiency Factor (NP/HR)", "#7A3FF2", "W/bpm"),
+                     ("decoupling", "Decoupling Pw:Hr", "#E08A00", "%")]
+            for i in range(0, len(specs), 2):
+                cols = st.columns(2)
+                for col, (field, title, color, unit) in zip(cols, specs[i:i+2]):
+                    with col:
+                        sub = trends.dropna(subset=[field]) if field in trends.columns else trends.iloc[0:0]
+                        if len(sub) >= 2:
+                            fig = go.Figure(go.Scatter(x=sub["date"], y=sub[field], mode="markers+lines",
+                                line=dict(color=color, width=1.5), marker=dict(size=5)))
+                            fig.update_layout(height=230, margin=dict(l=0, r=0, t=32, b=0),
+                                title=dict(text=f"{title} ({unit})", font=dict(size=13)), showlegend=False)
+                            st.plotly_chart(fig, use_container_width=True, key=f"trend_{field}")
+                        else:
+                            st.caption(f"{title}: dati insufficienti.")
+            st.caption("L'Efficiency Factor è più significativo sulle uscite aerobiche steady; "
+                       "sulle sessioni a intervalli è più rumoroso.")
         else:
             st.info("Nessun trend disponibile. Premi 'Analizza tutto lo storico'.")
 
