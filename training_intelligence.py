@@ -838,3 +838,224 @@ def analyze_season_from_intervals(athlete, athlete_id: str, api_key: str,
             "durability": durability, "n_durable": n_durable,
             "kj_threshold": kj_threshold, "trends": trends, "used": used,
             "power_hist": {"edges": hist_edges.tolist(), "counts": hist_counts.tolist()}}
+
+
+# --------------------------------------------------------------------------- #
+# 10. MODELLO DI PERFORMANCE INDIVIDUALIZZATO (Banister impulse-response)      #
+# --------------------------------------------------------------------------- #
+# Il PMC usa costanti FISSE (42/7 gg). Qui invece FITTIAMO le costanti sull'atleta:
+# dai suoi TSS giornalieri + una serie di performance misurate (es. eFTP nel tempo)
+# stimiamo k1,k2,tau1,tau2,p0. E' cio' che fanno WKO5/Xert: un modello TUO, non medio.
+#
+# Modello (Banister/Calvert): performance(t) = p0 + k1*Fitness(t) - k2*Fatigue(t)
+#   Fitness(t) = Fitness(t-1)*exp(-1/tau1) + TSS(t)
+#   Fatigue(t) = Fatigue(t-1)*exp(-1/tau2) + TSS(t)
+# ONESTA': ill-conditioned con pochi dati. Servono >= ~8 performance su settimane
+# diverse e con carico vario. Diamo R^2 e costanti fittate; se il fit e' povero,
+# meglio restare sul PMC classico.
+from scipy.optimize import least_squares as _least_squares
+
+
+def _ir_series(daily_tss: pd.Series, k1, k2, tau1, tau2, p0) -> pd.Series:
+    """Serie giornaliera di performance modellata dal filtro impulso-risposta."""
+    idx = daily_tss.index
+    vals = daily_tss.to_numpy(dtype=float)
+    g = h = 0.0
+    d1, d2 = np.exp(-1.0 / tau1), np.exp(-1.0 / tau2)
+    perf = np.empty(len(vals))
+    for i, w in enumerate(vals):
+        g = g * d1 + w
+        h = h * d2 + w
+        perf[i] = p0 + k1 * g - k2 * h
+    return pd.Series(perf, index=idx)
+
+
+def fit_banister(daily_tss: pd.Series, performance: pd.Series) -> dict:
+    """
+    Fitta il modello di Banister ai dati dell'atleta.
+    daily_tss   : Serie indicizzata per data (giornaliera, buchi = 0 TSS).
+    performance : Serie indicizzata per data (es. eFTP nei giorni di test/breakthrough).
+
+    Ritorna costanti fittate, R^2, la serie modellata e una Confidence basata sulla
+    bonta' del fit e sulla numerosita' dei punti.
+    """
+    dt = daily_tss.copy()
+    dt.index = pd.to_datetime(dt.index)
+    perf = performance.dropna().copy()
+    perf.index = pd.to_datetime(perf.index)
+    # griglia giornaliera continua (i buchi di allenamento sono 0 TSS)
+    full = pd.date_range(dt.index.min(), max(dt.index.max(), perf.index.max()), freq="D")
+    dt = dt.reindex(full, fill_value=0.0)
+    perf = perf[(perf.index >= full.min()) & (perf.index <= full.max())]
+    if len(perf) < 5:
+        return {"ok": False, "reason": "Servono >= 5 misure di performance per il fit.",
+                "confidence": Confidence.MODELED}
+
+    pos = {d: i for i, d in enumerate(full)}
+    p_idx = np.array([pos[d] for d in perf.index])
+    p_obs = perf.to_numpy(dtype=float)
+    p0_init = float(np.min(p_obs))
+
+    def resid(x):
+        k1, k2, tau1, tau2, p0 = x
+        model = _ir_series(dt, k1, k2, tau1, tau2, p0).to_numpy()
+        return model[p_idx] - p_obs
+
+    x0 = [0.05, 0.05, 42.0, 7.0, p0_init]
+    lower = [0.0, 0.0, 20.0, 3.0, p0_init - 3 * np.std(p_obs) - 50]
+    upper = [50.0, 50.0, 60.0, 21.0, np.max(p_obs)]
+    sol = _least_squares(resid, x0, bounds=(lower, upper), method="trf", max_nfev=5000)
+    k1, k2, tau1, tau2, p0 = [float(v) for v in sol.x]
+
+    ss_res = float(sol.fun @ sol.fun)
+    ss_tot = float(((p_obs - p_obs.mean()) ** 2).sum()) or 1e-9
+    r2 = 1 - ss_res / ss_tot
+    conf = (Confidence.ESTIMATED if (r2 > 0.7 and len(perf) >= 8) else Confidence.MODELED)
+    model_series = _ir_series(dt, k1, k2, tau1, tau2, p0)
+
+    return {
+        "ok": True,
+        "params": {"k1": round(k1, 4), "k2": round(k2, 4),
+                   "tau1": round(tau1, 1), "tau2": round(tau2, 1), "p0": round(p0, 1)},
+        "r2": round(r2, 3),
+        "n_points": len(perf),
+        "model_series": model_series,          # performance modellata, giornaliera
+        "confidence": conf,
+        "note": ("Costanti individualizzate (non 42/7 fisse). Con R^2 basso o pochi punti "
+                 "resta sul PMC classico. tau1=fitness, tau2=fatica; k1/k2 i rispettivi guadagni."),
+    }
+
+
+def predict_performance(fit: dict, future_daily_tss: pd.Series) -> pd.Series:
+    """
+    Proietta la performance in avanti con un piano di TSS futuri, usando le costanti
+    fittate. Utile per 'quanto sarò in forma se seguo questo carico'.
+    """
+    if not fit.get("ok"):
+        return pd.Series(dtype=float)
+    p = fit["params"]
+    return _ir_series(future_daily_tss, p["k1"], p["k2"], p["tau1"], p["tau2"], p["p0"])
+
+
+# --------------------------------------------------------------------------- #
+# 11. ACWR — acute:chronic workload ratio (rischio infortunio/sovraccarico)    #
+# --------------------------------------------------------------------------- #
+def acwr(daily_load: pd.Series, method: str = "rolling",
+         acute_days: int = 7, chronic_days: int = 28) -> dict:
+    """
+    Rapporto carico acuto:cronico (Gabbett). Standard attuale per il rischio: hai gia'
+    monotony/strain di Foster, questo e' il complemento moderno.
+
+    method="rolling": media mobile acuta (7 gg) / cronica (28 gg) — non accoppiato.
+    method="ewma"   : EWMA (Williams et al.) — piu' reattivo, pesi decrescenti.
+
+    Bande: <0.8 sotto-carico/detraining, 0.8-1.3 'sweet spot', 1.3-1.5 attenzione,
+    >1.5 rischio elevato ('training spike'). Regole del pollice, non legge fisica.
+    """
+    s = daily_load.copy()
+    s.index = pd.to_datetime(s.index)
+    full = pd.date_range(s.index.min(), s.index.max(), freq="D")
+    s = s.reindex(full, fill_value=0.0).astype(float)
+
+    if method == "ewma":
+        acute = s.ewm(halflife=acute_days / 2, min_periods=1).mean()
+        chronic = s.ewm(halflife=chronic_days / 2, min_periods=1).mean()
+    else:
+        acute = s.rolling(acute_days, min_periods=1).mean()
+        chronic = s.rolling(chronic_days, min_periods=1).mean()
+
+    ratio = (acute / chronic.replace(0, np.nan)).fillna(0.0)
+    latest = float(ratio.iloc[-1])
+
+    def band(x):
+        if x == 0:            return ("n/d", "grigio")
+        if x < 0.8:           return ("sotto-carico", "grigio")
+        if x <= 1.3:          return ("ottimale (sweet spot)", "verde")
+        if x <= 1.5:          return ("attenzione", "ambra")
+        return ("rischio elevato", "rosso")
+
+    label, color = band(latest)
+    df = pd.DataFrame({"day": full, "acute": acute.to_numpy(),
+                       "chronic": chronic.to_numpy(), "acwr": ratio.to_numpy()})
+    return {
+        "series": df,
+        "acwr": round(latest, 2),
+        "band": label,
+        "color": color,
+        "method": f"{method} ({acute_days}:{chronic_days} gg)",
+        "confidence": Confidence.ESTIMATED,
+        "note": ("Sweet spot 0.8-1.3. Un salto acuto (>1.5) e' il fattore di rischio piu' "
+                 "citato in letteratura. Complementa monotony/strain, non li sostituisce."),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 12. RILEVAMENTO BREAKTHROUGH / NUOVI RECORD / UPDATE eFTP                     #
+# --------------------------------------------------------------------------- #
+def _eftp_from_mmp(mmp: pd.Series):
+    """eFTP indicativa dalla curva: 95% del miglior 20 min, altrimenti 90% dell'8 min."""
+    if mmp is None or len(mmp) == 0:
+        return None
+    if 1200 in mmp.index:
+        return 0.95 * float(mmp[1200])
+    if 480 in mmp.index:
+        return 0.90 * float(mmp[480])
+    return None
+
+
+def detect_breakthroughs(prev_mmp: pd.Series, new_mmp: pd.Series,
+                         min_pct: float = 1.0, durations=None) -> dict:
+    """
+    Confronta la curva di potenza precedente (record stagionale) con una nuova uscita:
+    segnala i nuovi RECORD per durata (miglioramento >= min_pct) e l'eventuale update
+    di eFTP. E' l'aggancio per una notifica 'nuovo primato sui 5 min!'.
+
+    prev_mmp puo' essere una Serie vuota (primo dato -> tutto e' un primato).
+    """
+    new_mmp = new_mmp if new_mmp is not None else pd.Series(dtype=float)
+    prev_mmp = prev_mmp if prev_mmp is not None else pd.Series(dtype=float)
+    durs = durations or list(new_mmp.index)
+
+    records = []
+    for d in durs:
+        if d not in new_mmp.index:
+            continue
+        new_v = float(new_mmp[d])
+        prev_v = float(prev_mmp[d]) if d in prev_mmp.index else None
+        if prev_v is None or prev_v <= 0:
+            records.append({"duration_s": int(d), "new": round(new_v),
+                            "prev": None, "improvement_pct": None, "first_ever": True})
+        elif new_v >= prev_v * (1 + min_pct / 100.0):
+            records.append({"duration_s": int(d), "new": round(new_v), "prev": round(prev_v),
+                            "improvement_pct": round((new_v - prev_v) / prev_v * 100, 1),
+                            "first_ever": False})
+
+    prev_eftp, new_eftp = _eftp_from_mmp(prev_mmp), _eftp_from_mmp(new_mmp)
+    eftp_update = None
+    if new_eftp is not None:
+        if prev_eftp is None:
+            eftp_update = {"new": round(new_eftp), "prev": None, "delta": None}
+        elif new_eftp > prev_eftp * (1 + min_pct / 100.0):
+            eftp_update = {"new": round(new_eftp), "prev": round(prev_eftp),
+                           "delta": round(new_eftp - prev_eftp)}
+
+    msgs = []
+    for r in sorted(records, key=lambda x: x["duration_s"]):
+        dur = r["duration_s"]
+        dlabel = (f"{dur}s" if dur < 60 else f"{dur//60}min" if dur < 3600 else f"{dur/3600:.0f}h")
+        if r["first_ever"]:
+            msgs.append(f"Primo dato sui {dlabel}: {r['new']} W.")
+        else:
+            msgs.append(f"Nuovo primato {dlabel}: {r['new']} W (+{r['improvement_pct']}%).")
+    if eftp_update and eftp_update["delta"]:
+        msgs.append(f"eFTP in salita: {eftp_update['new']} W (+{eftp_update['delta']} W).")
+
+    return {
+        "records": records,
+        "n_records": len(records),
+        "eftp_update": eftp_update,
+        "notifications": msgs,
+        "has_breakthrough": bool(records) or bool(eftp_update and eftp_update.get("delta")),
+        "confidence": Confidence.MEASURED,
+        "note": "Nuovi record sulla curva = misurati. L'eFTP e' una stima derivata (ESTIMATED).",
+    }
