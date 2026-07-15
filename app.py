@@ -20,6 +20,9 @@ import plotly.graph_objects as go
 
 import cycling_analytics as ca
 import training_intelligence as ti
+import physics as ph
+import data_quality as dq
+import workout_export as wx
 from cycling_analytics import Confidence
 
 st.set_page_config(page_title="Cycling Lab", page_icon="🚴", layout="wide")
@@ -39,11 +42,16 @@ def badge(conf):
 
 def metric_card(col, title, m, big=True):
     val = f"{m.value:,.0f}" if big else f"{m.value:,.2f}"
+    ci_html = ""
+    if getattr(m, "ci", None) is not None:
+        ci_html = (f"<div style='font-size:.66rem;color:#5b6470'>95% CI "
+                   f"{m.ci[0]:,.0f}–{m.ci[1]:,.0f} {m.unit}</div>")
     col.markdown(
         f"<div style='line-height:1.25'><div style='font-size:.8rem;color:#5b6470'>{title}</div>"
         f"<div style='font-size:1.7rem;font-weight:800;color:#0C1623'>{val} "
         f"<span style='font-size:.9rem;font-weight:500;color:#8a939f'>{m.unit}</span></div>"
         f"{badge(m.confidence)}"
+        f"{ci_html}"
         f"<div style='font-size:.68rem;color:#8a939f;margin-top:3px'>{m.method}</div></div>",
         unsafe_allow_html=True)
 
@@ -53,6 +61,52 @@ def state_card(col, title, value, sub, color="#0C1623", size="1.7rem"):
         f"<div style='font-size:{size};font-weight:800;color:{color}'>{value}</div>"
         f"<div style='font-size:.7rem;color:#8a939f;margin-top:3px'>{sub}</div></div>",
         unsafe_allow_html=True)
+
+# --------------------------------------------------------------------------- #
+#  Banner qualità dati (trust layer) + download workout                       #
+# --------------------------------------------------------------------------- #
+def dq_banner(df):
+    """Mostra il badge di qualità dei dati con i flag principali (trust layer)."""
+    try:
+        q = dq.assess_data_quality(df)
+    except Exception:
+        return
+    color = {"buono": "#2e9e5b", "attenzione": "#E08A00", "scarso": "#B0392E"}[q["level"]]
+    flags = "".join(f"<li style='font-size:.74rem;color:#5b6470'>{f['msg']}</li>"
+                    for f in q["flags"][:4])
+    st.markdown(
+        f"<div style='border-left:4px solid {color};padding:6px 12px;background:#f6f7f9;"
+        f"border-radius:4px;margin-bottom:6px'>"
+        f"<b style='color:{color}'>Qualità dati: {q['level'].upper()} ({q['score']}/100)</b> "
+        f"— {q['summary']}<ul style='margin:4px 0 0 16px;padding:0'>{flags}</ul></div>",
+        unsafe_allow_html=True)
+
+WORKOUT_FMTS = [("Zwift .zwo", "zwo", "text/xml"),
+                ("ERG .erg", "erg", "text/plain"),
+                ("MRC .mrc", "mrc", "text/plain"),
+                ("Garmin .fit", "fit", "application/octet-stream")]
+
+def render_workout_downloads(kind, ftp, key_prefix):
+    """Costruisce il workout strutturato dal 'kind' consigliato e offre i download."""
+    try:
+        w = wx.build_structured_workout(kind, float(ftp or 250))
+    except Exception:
+        return
+    s = wx.summary(w)
+    st.caption(f"📥 **Scarica il workout strutturato** — {s['duration_min']} min · "
+               f"~{s['tss']:.0f} TSS stimati · {s['n_steps']} step")
+    cols = st.columns(len(WORKOUT_FMTS))
+    for col, (label, fmt, mime) in zip(cols, WORKOUT_FMTS):
+        try:
+            data = wx.export(w, fmt)
+            if isinstance(data, str):
+                data = data.encode("utf-8")
+            col.download_button(label, data=data, mime=mime,
+                                file_name=f"{w.name.replace(' ', '_')}.{fmt}",
+                                key=f"{key_prefix}_{fmt}", use_container_width=True)
+        except Exception:
+            col.button(f"{label} n/d", disabled=True, key=f"{key_prefix}_{fmt}_na",
+                       use_container_width=True)
 
 # --------------------------------------------------------------------------- #
 #  Dati demo                                                                  #
@@ -175,7 +229,10 @@ if mode.startswith("📄"):
     st.caption("VO2max, classificazione e curva di potenza su TUTTE le uscite sono nella scheda "
                "📊 Stagione — lì hanno senso, qui no (una singola uscita non li rappresenta).")
 
-    t = st.tabs(["📈 Curva della uscita", "🎯 Soglie & Zone", "🔬 Analisi sessione", "🔥 Metabolismo"])
+    dq_banner(df)    # trust layer: badge qualità dati con i flag principali
+
+    t = st.tabs(["📈 Curva della uscita", "🎯 Soglie & Zone", "🔬 Analisi sessione",
+                 "🔥 Metabolismo", "🏔️ Fisica & Salite"])
 
     # -- Curva della uscita --
     with t[0]:
@@ -196,6 +253,17 @@ if mode.startswith("📄"):
             st.plotly_chart(fig, use_container_width=True)
             st.caption("Questa è la curva della SINGOLA uscita, non il tuo profilo. "
                        "Per il profilo vero vai su 📊 Stagione.")
+            # 🎉 Breakthrough: questa uscita ha battuto i record stagionali?
+            _season = st.session_state.get("season")
+            _sc = _season.get("season_curve") if _season else None
+            if _sc is not None and len(_sc):
+                bt = ti.detect_breakthroughs(_sc, mmp, min_pct=1.0)
+                if bt["has_breakthrough"]:
+                    st.success("🎉 " + " ".join(bt["notifications"][:6]))
+                    st.caption("Confronto con la curva stagionale caricata. Se questa uscita è "
+                               "già inclusa nella stagione, i record possono non comparire.")
+                else:
+                    st.caption("Nessun nuovo record stagionale in questa uscita.")
         else:
             st.info("Servono dati di potenza.")
 
@@ -362,6 +430,58 @@ if mode.startswith("📄"):
         else:
             st.info("Servono dati di potenza o HR.")
 
+    # -- Fisica & Salite --
+    with t[4]:
+        st.markdown("### Quota, salite e aerodinamica")
+        bike_kg = st.number_input("Peso bici + accessori (kg)", 5.0, 20.0, 8.0, 0.5,
+                                  key="bike_kg", help="Serve per VAM in W/kg e per la stima CdA/Crr.")
+        total_mass = mass + bike_kg
+        try:
+            phys = ph.analyze_physics(df, total_mass_kg=total_mass)
+        except Exception as e:
+            phys = {"available": {"reason": str(e)}}
+        avail = phys.get("available", {})
+        if not avail.get("climbs"):
+            st.info("Analisi altimetrica non disponibile — " +
+                    avail.get("reason", "servono i canali quota e velocità (es. da .fit/intervals.icu)."))
+        else:
+            climbs = phys["climbs"]
+            cM = st.columns(3)
+            cM[0].metric("Dislivello totale", f"{phys.get('total_gain_m', 0):.0f} m")
+            cM[1].metric("Salite rilevate", climbs["n_climbs"])
+            if phys.get("air_density"):
+                cM[2].metric("Densità aria", f"{phys['air_density']:.3f} kg/m³")
+            st.markdown(f"#### Salite e VAM {badge(climbs['confidence'])}", unsafe_allow_html=True)
+            if climbs["climbs"]:
+                rows = []
+                for c in climbs["climbs"]:
+                    row = {"Categoria": c["category"], "Lunghezza": f"{c['length_m']/1000:.1f} km",
+                           "Dislivello": f"{c['elev_gain_m']:.0f} m", "Pendenza": f"{c['avg_grade_pct']}%",
+                           "VAM (m/h)": c["vam"], "Livello VAM": c["vam_level"]}
+                    if "w_kg" in c:
+                        row["W/kg"] = c["w_kg"]
+                    rows.append(row)
+                st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+                st.caption(climbs["note"])
+            else:
+                st.info("Nessuna salita significativa in questa uscita (percorso piatto).")
+
+            if "aero" in phys:
+                aero = phys["aero"]
+                st.divider()
+                st.markdown(f"#### Aerodinamica — metodo Chung {badge(aero['confidence'])}",
+                            unsafe_allow_html=True)
+                ac = st.columns(3)
+                metric_card(ac[0], "CdA (area frontale)", aero["cda"], big=False)
+                metric_card(ac[1], "Crr (rotolamento)", ca.Metric(
+                    aero["crr"].value, "", aero["crr"].confidence, aero["crr"].method,
+                    ci=aero["crr"].ci), big=False)
+                ac[2].metric("Fit (RMSE quota)", f"{aero['rmse_elevation_m']:.1f} m", aero["fit_quality"])
+                st.caption("⚠️ " + aero["note"])
+            elif avail.get("aero") is False:
+                st.caption("Stima aerodinamica non riuscita su questa uscita "
+                           "(serve potenza + velocità variabile, poco vento).")
+
 # ========================================================================== #
 #  MODALITÀ 2 — STAGIONE (TUTTE LE ATTIVITÀ)                                 #
 # ========================================================================== #
@@ -509,6 +629,31 @@ elif mode.startswith("📊"):
             fig.update_layout(height=320, margin=dict(l=0,r=0,t=10,b=0), yaxis=dict(title="CTL/ATL"),
                               yaxis2=dict(title="TSB", overlaying="y", side="right"), legend=dict(orientation="h", y=1.15))
             st.plotly_chart(fig, use_container_width=True, key="pmc_season")
+
+            # ACWR — rapporto carico acuto:cronico (rischio sovraccarico)
+            try:
+                daily = pd.Series(pmc["tss"].values, index=pd.to_datetime(pmc["day"]))
+                aw = ti.acwr(daily, method="rolling")
+                acolor = {"verde": "#2e9e5b", "ambra": "#E08A00", "rosso": "#B0392E",
+                          "grigio": "#8a939f"}.get(aw["color"], "#0C1623")
+                st.markdown(f"#### Carico acuto:cronico (ACWR) {badge(aw['confidence'])}",
+                            unsafe_allow_html=True)
+                ca1, ca2 = st.columns([1, 3])
+                state_card(ca1, "ACWR", f"{aw['acwr']:.2f}", aw["band"], color=acolor)
+                with ca2:
+                    adf = aw["series"]
+                    figa = go.Figure()
+                    figa.add_hrect(y0=0.8, y1=1.3, fillcolor="#2e9e5b", opacity=0.10, line_width=0)
+                    figa.add_trace(go.Scatter(x=adf["day"], y=adf["acwr"], mode="lines",
+                                              line=dict(color=acolor, width=2)))
+                    figa.add_hline(y=1.5, line_dash="dot", line_color="#B0392E")
+                    figa.update_layout(height=170, margin=dict(l=0, r=0, t=6, b=0),
+                                       yaxis_title="ACWR", yaxis_range=[0, 2])
+                    st.plotly_chart(figa, use_container_width=True, key="acwr_season")
+                st.caption("Sweet spot 0.8–1.3 (fascia verde). Sopra 1.5 = salto di carico, "
+                           "il fattore di rischio più citato. " + aw["note"])
+            except Exception:
+                pass
 
         # Distribuzione di intensità (polarizzazione, Seiler 80/20)
         if res and profile and res.get("power_hist"):
@@ -789,6 +934,7 @@ else:
             st.markdown(f"**Perché:** {rec['rationale']}")
             if rec["alternatives"]:
                 st.markdown(f"**Alternativa:** {rec['alternatives'][0]['name']} — {rec['alternatives'][0]['prescription']}")
+            render_workout_downloads(r["kind"], ftp_val or 250, "rec")
             st.caption("⚠️ " + rec["disclaimer"])
         else:
             st.info("Aggiungi almeno un allenamento.")
@@ -847,6 +993,7 @@ else:
             st.markdown(f"#### 🎯 Questa settimana — Fase **{tw['phase']}**")
             st.success(f"**{tw['session']['name']}** — {tw['session']['prescription']}  · _{tw['session']['expected_tss']}_")
             st.caption(tw["focus"])
+            render_workout_downloads(tw["session"]["kind"], ftp_val or 250, "plan")
             with st.expander("Piano settimana per settimana"):
                 st.dataframe(pd.DataFrame([{"Sett":w["week"],"Fase":w["phase"],"CTL target":w["target_ctl"],
                             "TSS target":w["weekly_tss"],"Focus":w["focus"],"Seduta":w["session"]["name"]}
