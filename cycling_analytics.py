@@ -49,15 +49,35 @@ class Confidence(str, Enum):
 
 @dataclass
 class Metric:
-    """Contenitore uniforme: valore + come e' stato ottenuto + quanto ci fidiamo."""
+    """Contenitore uniforme: valore + come e' stato ottenuto + quanto ci fidiamo.
+
+    ci / sd sono OPZIONALI (default None) per retro-compatibilita': quando presenti
+    quantificano l'incertezza reale del numero (non solo l'etichetta di confidence).
+    - sd  : deviazione standard stimata del valore (1 sigma).
+    - ci  : intervallo (lo, hi) al 95% (tipicamente valore +/- 1.96*sd).
+    Il differenziatore diventa cosi' DIMOSTRABILE: '250 +/- 8 W', non solo 'stimato'.
+    """
     value: float
     unit: str
     confidence: Confidence
     method: str
     note: str = ""
+    sd: Optional[float] = None
+    ci: Optional[tuple[float, float]] = None
+
+    @property
+    def ci_str(self) -> str:
+        """Rappresentazione compatta dell'intervallo, '' se assente."""
+        if self.ci is None:
+            return ""
+        lo, hi = self.ci
+        return f"{lo:.0f}–{hi:.0f} {self.unit}".strip()
 
     def __repr__(self):
-        return f"{self.value:.2f} {self.unit} [{self.confidence.value}: {self.method}]"
+        base = f"{self.value:.2f} {self.unit}"
+        if self.ci is not None:
+            base += f" (95% CI {self.ci[0]:.1f}–{self.ci[1]:.1f})"
+        return f"{base} [{self.confidence.value}: {self.method}]"
 
 
 # --------------------------------------------------------------------------- #
@@ -210,15 +230,26 @@ def critical_power(mmp: pd.Series,
         raise ValueError("Servono >=3 sforzi massimali tra 2 e 20 min per stimare CP/W'.")
     t = pts.index.values.astype(float)
     p = pts.values.astype(float)
+    cp_sd = w_sd = None                      # deviazioni standard dei parametri (1 sigma)
 
     if model == "linear":
         w = p * t
-        A = np.vstack([t, np.ones_like(t)]).T
-        cp, w_prime = np.linalg.lstsq(A, w, rcond=None)[0]
+        A = np.vstack([t, np.ones_like(t)]).T   # colonne: [t, 1] -> [CP, W']
+        beta, *_ = np.linalg.lstsq(A, w, rcond=None)
+        cp, w_prime = beta
+        # covarianza OLS: sigma^2 * (A'A)^-1, sigma^2 = SSR/(n-2)
+        resid = w - A @ beta
+        dof = max(len(t) - 2, 1)
+        sigma2 = float(resid @ resid) / dof
+        cov = sigma2 * np.linalg.inv(A.T @ A)
+        cp_sd, w_sd = float(np.sqrt(cov[0, 0])), float(np.sqrt(cov[1, 1]))
         method = "modello lineare 2-par (W = W' + CP*t)"
         pmax = None
     elif model == "hyperbolic":
-        (cp, w_prime), _ = curve_fit(_cp_hyperbolic, t, p, p0=[p.min(), 20000], maxfev=10000)
+        (cp, w_prime), cov = curve_fit(_cp_hyperbolic, t, p,
+                                       p0=[p.min(), 20000], maxfev=10000)
+        if cov is not None and np.all(np.isfinite(cov)):
+            cp_sd, w_sd = float(np.sqrt(abs(cov[0, 0]))), float(np.sqrt(abs(cov[1, 1])))
         method = "modello iperbolico 2-par (P = CP + W'/t)"
         pmax = None
     else:  # 3param
@@ -229,25 +260,34 @@ def critical_power(mmp: pd.Series,
         if has_short:
             p0 = [p.min() * 0.9, 20000, float(mmp.get(1, p.max() * 1.5))]
             try:
-                (cp, w_prime, pmax), _ = curve_fit(
+                (cp, w_prime, pmax), cov = curve_fit(
                     _cp_3param, t, p, p0=p0, maxfev=20000,
                     bounds=([50, 1000, 500], [700, 60000, 3000]))
                 method = "modello 3-par Morton"
                 if not (cp < pmax < 3000):   # sanity check fisiologico
                     raise ValueError("Pmax non fisiologico")
+                if cov is not None and np.all(np.isfinite(cov)):
+                    cp_sd, w_sd = float(np.sqrt(abs(cov[0, 0]))), float(np.sqrt(abs(cov[1, 1])))
             except Exception:
                 pmax = None
         if pmax is None:
-            (cp, w_prime), _ = curve_fit(_cp_hyperbolic, t, p,
-                                         p0=[p.min(), 20000], maxfev=10000)
+            (cp, w_prime), cov = curve_fit(_cp_hyperbolic, t, p,
+                                           p0=[p.min(), 20000], maxfev=10000)
+            if cov is not None and np.all(np.isfinite(cov)):
+                cp_sd, w_sd = float(np.sqrt(abs(cov[0, 0]))), float(np.sqrt(abs(cov[1, 1])))
             method = ("iperbolico 2-par (3-par non applicabile: "
                       "manca uno sforzo <30 s nel range di fit)")
 
+    def _ci(val, sd):
+        return (val - 1.96 * sd, val + 1.96 * sd) if sd is not None else None
+
     res = {
         "cp": Metric(float(cp), "W", Confidence.MEASURED, method,
-                     "Asintoto potenza-durata. Proxy della soglia sostenibile."),
+                     "Asintoto potenza-durata. Proxy della soglia sostenibile.",
+                     sd=cp_sd, ci=_ci(float(cp), cp_sd)),
         "w_prime": Metric(float(w_prime), "J", Confidence.MEASURED, method,
-                          "Lavoro erogabile sopra CP. ~15-25 kJ tipico; sprinter piu' alto."),
+                          "Lavoro erogabile sopra CP. ~15-25 kJ tipico; sprinter piu' alto.",
+                          sd=w_sd, ci=_ci(float(w_prime), w_sd)),
     }
     if pmax is not None:
         res["pmax"] = Metric(float(pmax), "W", Confidence.ESTIMATED, method,
@@ -284,7 +324,17 @@ def estimate_ftp(mmp: pd.Series, cp: Optional[float] = None) -> dict[str, Metric
     priority = ["ftp_from_cp", "ftp_20min", "ftp_8min"]
     for key in priority:
         if key in out:
-            out["ftp_recommended"] = out[key]
+            rec = out[key]
+            # dispersione tra TUTTI i metodi disponibili = incertezza onesta sulla FTP
+            estimates = [m.value for k, m in out.items()
+                         if k in ("ftp_from_cp", "ftp_20min", "ftp_8min")]
+            if len(estimates) >= 2:
+                lo, hi = min(estimates), max(estimates)
+                out["ftp_recommended"] = Metric(rec.value, "W", rec.confidence,
+                    rec.method, rec.note + f" Range tra i metodi: {lo:.0f}–{hi:.0f} W.",
+                    sd=(hi - lo) / 2, ci=(lo, hi))
+            else:
+                out["ftp_recommended"] = rec
             break
     return out
 
@@ -330,10 +380,17 @@ def estimate_vo2max(athlete: Athlete, map_watt: float) -> dict[str, Metric]:
         vo2_abs = 9.39 * map_watt + 7.7 * m - 5.88 * athlete.age + 136.7
     out["vo2max_storer"] = Metric(vo2_abs / m, "mL/kg/min", Confidence.ESTIMATED,
         "Storer et al. 1990", "Regressione di popolazione specifica per ciclismo.")
-    # Media delle stime come valore mostrato
-    mean_v = np.mean([out["vo2max_acsm"].value, out["vo2max_storer"].value])
+    # Media delle stime come valore mostrato; la DISPERSIONE tra i due metodi
+    # indipendenti e' una misura onesta dell'incertezza (oltre all'errore intrinseco
+    # ~+/-10-15% di ciascuna equazione). Prendiamo il piu' ampio tra i due.
+    vals = [out["vo2max_acsm"].value, out["vo2max_storer"].value]
+    mean_v = float(np.mean(vals))
+    spread = float(abs(vals[0] - vals[1]) / 2)           # meta'-range tra i metodi
+    intrinsic = mean_v * 0.12                             # ~12% errore tipico di popolazione
+    band = float(np.hypot(spread, intrinsic))            # combina le due fonti di incertezza
     out["vo2max"] = Metric(mean_v, "mL/kg/min", Confidence.ESTIMATED,
-        "media ACSM + Storer", "Stima; per un valore vero serve test in laboratorio.")
+        "media ACSM + Storer", "Stima; per un valore vero serve test in laboratorio.",
+        sd=band, ci=(mean_v - band, mean_v + band))
     return out
 
 
