@@ -236,3 +236,53 @@ def test_detect_breakthroughs_first_ever():
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ===================== GPS / lat-lon (mappa a monte) ====================== #
+def test_semicircles_to_deg_roundtrip():
+    deg = 45.123456
+    semi = int(deg / (180 / 2**31))
+    assert ca._semicircles_to_deg(semi) == pytest.approx(deg, abs=1e-5)
+    assert ca._semicircles_to_deg(None) is None
+
+def test_latlon_aliases_resolved():
+    df = ca.parse_records([{"timestamp": i, "power": 200,
+                            "latitude": 45.0 + i*1e-4, "longitude": 9.0} for i in range(4)])
+    assert "lat" in df.columns and "lon" in df.columns
+    assert df["lat"].iloc[0] == pytest.approx(45.0)
+
+def test_to_1hz_interpolates_latlon_without_zero_fill():
+    df = pd.DataFrame({"t": range(6), "power": [200]*6,
+                       "lat": [45.0, None, 45.002, None, None, 45.010],
+                       "lon": [9.0, 9.001, None, 9.003, 9.004, 9.005]})
+    out = ca.to_1hz(df)
+    assert out["lat"].dtype.kind == "f"
+    assert not (out["lat"] == 0).any()            # niente 0,0 (bug GPS)
+    assert out["lat"].iloc[1] == pytest.approx(45.001, abs=1e-3)   # buco breve interpolato
+
+
+# ===================== POTENZA PONDERATA (NP) & FTP-NP ===================== #
+def test_best_np_window_constant():
+    p = np.full(4000, 250.0)
+    bw = ca.best_np_window(p, 3600)
+    assert bw["np"] == pytest.approx(250, abs=0.5)
+    assert bw["vi"] == pytest.approx(1.0, abs=0.005)
+
+def test_best_np_window_variable_np_exceeds_mean():
+    rng = np.random.default_rng(0)
+    p = np.clip(rng.normal(250, 120, 4000), 0, None)
+    bw = ca.best_np_window(p, 3600)
+    assert bw["np"] > bw["mean"]                  # Jensen: NP >= media
+    assert bw["vi"] > 1.0
+
+def test_best_np_window_too_short_is_none():
+    assert ca.best_np_window(np.full(100, 200.0), 3600) is None
+
+def test_ftp_from_np_long_constant():
+    ftp = ca.ftp_from_np_long(np.full(4000, 260.0), 3600)
+    assert ftp is not None
+    assert ftp.value == pytest.approx(260, abs=0.5)   # nessuno sconto 0.95 sui 60 min
+    assert ftp.confidence == Confidence.ESTIMATED
+
+def test_ftp_from_np_long_short_ride_none():
+    assert ca.ftp_from_np_long(np.full(600, 200.0), 3600) is None
