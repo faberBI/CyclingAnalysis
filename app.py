@@ -232,7 +232,7 @@ if mode.startswith("📄"):
     dq_banner(df)    # trust layer: badge qualità dati con i flag principali
 
     t = st.tabs(["📈 Curva della uscita", "🎯 Soglie & Zone", "🔬 Analisi sessione",
-                 "🔥 Metabolismo", "🏔️ Fisica & Salite"])
+                 "🔥 Metabolismo", "🏔️ Fisica & Salite", "🗺️ Mappa"])
 
     # -- Curva della uscita --
     with t[0]:
@@ -278,6 +278,26 @@ if mode.startswith("📄"):
             metric_card(cc[2], "W' (anaerobico)", ca.Metric(cp_res["w_prime"].value/1000, "kJ",
                         cp_res["w_prime"].confidence, cp_res["w_prime"].method), big=False)
             metric_card(cc[3], "MAP", map_m)
+
+            # FTP da NP (potenza ponderata) sugli sforzi lunghi tipo-gara + flag VI del test
+            ftp_np = ca.ftp_from_np_long(power, 3600) if has_power else None
+            bw20 = ca.best_np_window(power, 1200) if has_power else None
+            if ftp_np or bw20:
+                st.markdown("##### FTP — metodi lunghi e validità del test")
+                if ftp_np:
+                    st.markdown(f"- **{ftp_np.value:.0f} W** — {ftp_np.method} {badge(ftp_np.confidence)} "
+                                f"· _{ftp_np.note}_", unsafe_allow_html=True)
+                else:
+                    st.caption("Uscita < 60 min: niente FTP da NP dello sforzo lungo (serve ~1 h sostenuta).")
+                if bw20:
+                    if bw20["vi"] > 1.05:
+                        st.warning(f"⚠️ Il miglior 20 min NON era steady (VI {bw20['vi']:.2f}): il test dei "
+                                   "20 min presuppone uno sforzo costante, quindi la FTP da 20 min qui può "
+                                   "essere sovrastimata. Meglio un test più regolare o la FTP da CP.")
+                    else:
+                        st.caption(f"Il miglior 20 min è regolare (VI {bw20['vi']:.2f}): "
+                                   "il test dei 20 min è affidabile.")
+
             st.divider()
             col1, col2 = st.columns(2)
             with col1:
@@ -298,7 +318,7 @@ if mode.startswith("📄"):
             st.divider()
             st.markdown("#### Carico dell'uscita")
             lc = st.columns(4)
-            metric_card(lc[0], "Normalized Power", lm["normalized_power"])
+            metric_card(lc[0], "Potenza ponderata (NP)", lm["normalized_power"])
             metric_card(lc[1], "Intensity Factor", lm["intensity_factor"], big=False)
             metric_card(lc[2], "TSS", lm["tss"])
             metric_card(lc[3], "Variability Index", lm["variability_index"], big=False)
@@ -481,6 +501,42 @@ if mode.startswith("📄"):
             elif avail.get("aero") is False:
                 st.caption("Stima aerodinamica non riuscita su questa uscita "
                            "(serve potenza + velocità variabile, poco vento).")
+
+    # -- Mappa del percorso --
+    with t[5]:
+        st.markdown("### Mappa del percorso")
+        has_gps = ("lat" in df.columns and "lon" in df.columns
+                   and df["lat"].notna().any() and df["lon"].notna().any())
+        if not has_gps:
+            st.info("Nessun dato GPS in questa uscita. Serve un file con posizione "
+                    "(es. .fit outdoor o intervals.icu con stream GPS). Le uscite indoor/rullo "
+                    "non hanno traccia.")
+        else:
+            gps = df[df["lat"].notna() & df["lon"].notna()]
+            stepL = max(1, len(gps) // 2500)          # downsample per performance
+            s = gps.iloc[::stepL]
+            clat, clon = float(gps["lat"].mean()), float(gps["lon"].mean())
+            span = max(float(gps["lat"].max() - gps["lat"].min()),
+                       float(gps["lon"].max() - gps["lon"].min())) or 0.01
+            zoom = int(np.clip(np.log2(360.0 / span) - 1, 8, 15))
+            fig = go.Figure()
+            fig.add_trace(go.Scattermap(lat=s["lat"], lon=s["lon"], mode="lines",
+                          line=dict(width=4, color="#0A45FA"), name="Percorso", hoverinfo="skip"))
+            if has_power and "power" in s.columns and s["power"].notna().any():
+                fig.add_trace(go.Scattermap(lat=s["lat"], lon=s["lon"], mode="markers",
+                    marker=dict(size=6, color=s["power"], colorscale="Turbo",
+                                showscale=True, colorbar=dict(title="W")),
+                    name="Potenza", hovertemplate="%{marker.color:.0f} W<extra></extra>"))
+            fig.add_trace(go.Scattermap(lat=[float(gps["lat"].iloc[0])], lon=[float(gps["lon"].iloc[0])],
+                          mode="markers", marker=dict(size=12, color="#2e9e5b"), name="Start", hoverinfo="skip"))
+            fig.add_trace(go.Scattermap(lat=[float(gps["lat"].iloc[-1])], lon=[float(gps["lon"].iloc[-1])],
+                          mode="markers", marker=dict(size=12, color="#B0392E"), name="Fine", hoverinfo="skip"))
+            fig.update_layout(map_style="open-street-map",
+                              map=dict(center=dict(lat=clat, lon=clon), zoom=zoom),
+                              height=520, margin=dict(l=0, r=0, t=0, b=0), showlegend=False)
+            st.plotly_chart(fig, use_container_width=True, key="route_map")
+            st.caption("Traccia colorata per potenza (se disponibile). Verde = partenza, rosso = arrivo. "
+                       "Mappa © OpenStreetMap.")
 
 # ========================================================================== #
 #  MODALITÀ 2 — STAGIONE (TUTTE LE ATTIVITÀ)                                 #
