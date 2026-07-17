@@ -107,7 +107,7 @@ class Athlete:
 # --------------------------------------------------------------------------- #
 #  1. PREPROCESSING — porta qualunque ride a 1 Hz, colonne standard           #
 # --------------------------------------------------------------------------- #
-STD_COLS = ["t", "power", "hr", "cadence", "speed", "altitude"]
+STD_COLS = ["t", "power", "hr", "cadence", "speed", "altitude", "lat", "lon"]
 
 
 def to_1hz(df: pd.DataFrame, time_col: str = "t") -> pd.DataFrame:
@@ -145,13 +145,17 @@ def to_1hz(df: pd.DataFrame, time_col: str = "t") -> pd.DataFrame:
     d = d.reindex(full)
 
     # --- forza numerico su TUTTE le colonne dati prima di interpolare ---
-    for c in ["power", "hr", "cadence", "speed", "altitude"]:
+    for c in ["power", "hr", "cadence", "speed", "altitude", "lat", "lon"]:
         if c in d.columns:
             d[c] = pd.to_numeric(d[c], errors="coerce")
 
     if "power" in d.columns:
         d["power"] = d["power"].interpolate(limit=3).fillna(0).clip(lower=0)
     for c in ["hr", "cadence", "speed", "altitude"]:
+        if c in d.columns:
+            d[c] = d[c].interpolate(limit=5)
+    # lat/lon: interpola i buchi brevi ma NON riempire con 0 (0,0 = bug GPS al largo)
+    for c in ["lat", "lon"]:
         if c in d.columns:
             d[c] = d[c].interpolate(limit=5)
     d.index.name = "t"
@@ -492,6 +496,50 @@ def load_metrics(power: np.ndarray, ftp: float) -> dict[str, Metric]:
     }
 
 
+def best_np_window(power: np.ndarray, window_s: int) -> Optional[dict]:
+    """
+    Trova la finestra di durata `window_s` con la NP (potenza ponderata) piu' alta e
+    ne restituisce NP, media e VI (=NP/media). Serve alla FTP-da-NP sugli sforzi lunghi
+    e al flag di 'quanto era steady' un test.
+
+    NP di ogni finestra = ( media su window_s di (media mobile 30 s)^4 )^(1/4).
+    Implementazione O(n) con rolling di pandas. Ritorna None se la ride e' piu' corta.
+    """
+    p = pd.Series(np.nan_to_num(np.asarray(power, dtype=float), nan=0.0))
+    if len(p) < window_s:
+        return None
+    r30 = p.rolling(30, min_periods=1).mean()
+    np_win = (r30.pow(4).rolling(window_s).mean()) ** 0.25   # NP della finestra che finisce in i
+    mean_win = p.rolling(window_s).mean()
+    end = int(np_win.idxmax())
+    np_v, mean_v = float(np_win.iloc[end]), float(mean_win.iloc[end])
+    vi = np_v / mean_v if mean_v else 1.0
+    return {"np": np_v, "mean": mean_v, "vi": vi,
+            "start_s": max(0, end - window_s + 1), "end_s": end, "window_s": window_s}
+
+
+def ftp_from_np_long(power: np.ndarray, window_s: int = 3600) -> Optional[Metric]:
+    """
+    FTP stimata dalla NP (potenza ponderata) del miglior sforzo ~lungo (default 60 min).
+
+    RAZIONALE (perche' qui va bene e sul test 20 min no): su uno sforzo tipo-gara di
+    ~1 h, variabile, la NP e' un proxy di FTP migliore della media grezza — ed e' gia'
+    ~la durata della FTP, quindi NESSUNO sconto 0.95. Sul test 20 min invece la NP
+    gonfia la FTP (disuguaglianza di Jensen) e va evitata: li' si usa la media.
+
+    ONESTA': vale SOLO se quell'ora e' stata sostenuta e dura. Il VI della finestra dice
+    quanto era steady; con VI alto (partenza/arrivo mossi) la stima e' meno affidabile.
+    """
+    bw = best_np_window(power, window_s)
+    if bw is None:
+        return None
+    mins = window_s // 60
+    return Metric(bw["np"], "W", Confidence.ESTIMATED,
+                  f"NP del miglior ~{mins} min",
+                  f"Valida SOLO se quell'ora e' stata uno sforzo tipo-gara sostenuto "
+                  f"(VI finestra {bw['vi']:.2f}). In un'uscita facile NON e' FTP.")
+
+
 # --------------------------------------------------------------------------- #
 #  8. CALORIE & SUBSTRATI                                                      #
 # --------------------------------------------------------------------------- #
@@ -757,6 +805,8 @@ COL_ALIASES = {
     "cadence":  ["cadence", "cad", "rpm"],
     "speed":    ["speed", "velocity_smooth", "kph", "enhanced_speed", "velocity"],
     "altitude": ["altitude", "elevation", "alt", "enhanced_altitude", "ele"],
+    "lat":      ["lat", "latitude", "position_lat", "pos_lat"],
+    "lon":      ["lon", "lng", "long", "longitude", "position_long", "position_lon", "pos_long"],
 }
 
 def _resolve_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -781,10 +831,17 @@ def load_csv(file) -> pd.DataFrame:
     """CSV da Garmin Connect / intervals.icu / export generici, con alias colonne."""
     return _resolve_columns(pd.read_csv(file))
 
+def _semicircles_to_deg(v):
+    """FIT registra lat/lon in 'semicircles' (int32). Converte in gradi decimali."""
+    if v is None:
+        return None
+    return float(v) * (180.0 / 2 ** 31)
+
 def load_fit(file) -> pd.DataFrame:
     """
     File .fit (Garmin, Polar, Wahoo, ...). Legge i messaggi 'record'.
     Gestisce campi mancanti e developer fields (alcuni power meter li usano).
+    Estrae anche la posizione GPS (semicircles -> gradi) per la mappa del percorso.
     """
     from fitparse import FitFile
     fit = FitFile(file)
@@ -798,6 +855,8 @@ def load_fit(file) -> pd.DataFrame:
             "cadence":   d.get("cadence"),
             "speed":     d.get("enhanced_speed", d.get("speed")),
             "altitude":  d.get("enhanced_altitude", d.get("altitude")),
+            "lat":       _semicircles_to_deg(d.get("position_lat")),
+            "lon":       _semicircles_to_deg(d.get("position_long")),
         })
     return parse_records(rows)
 
@@ -819,10 +878,13 @@ def load_intervals_icu(activity_id: str, api_key: str) -> pd.DataFrame:
                               "AppleWebKit/537.36 (KHTML, like Gecko) "
                               "Chrome/120.0 Safari/537.36")}
     r = requests.get(url, auth=("API_KEY", api_key), headers=headers,
-                     params={"types": "time,watts,heartrate,cadence,velocity_smooth,altitude"},
+                     params={"types": "time,watts,heartrate,cadence,velocity_smooth,altitude,latlng"},
                      timeout=30)
     r.raise_for_status()
     streams = {s["type"]: s["data"] for s in r.json()}
+    latlng = streams.get("latlng") or []
+    lat = [p[0] if isinstance(p, (list, tuple)) and len(p) == 2 else None for p in latlng]
+    lon = [p[1] if isinstance(p, (list, tuple)) and len(p) == 2 else None for p in latlng]
     df = pd.DataFrame({
         "t":        streams.get("time", list(range(len(streams.get("watts", []))))),
         "power":    streams.get("watts"),
@@ -830,6 +892,8 @@ def load_intervals_icu(activity_id: str, api_key: str) -> pd.DataFrame:
         "cadence":  streams.get("cadence"),
         "speed":    streams.get("velocity_smooth"),
         "altitude": streams.get("altitude"),
+        "lat":      lat or None,
+        "lon":      lon or None,
     })
     return _resolve_columns(df)
 
